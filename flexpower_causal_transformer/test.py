@@ -1,6 +1,6 @@
 """
 Flex Power Detection Testing Script
-模型测试和评估脚本
+模型测试和评估脚本 - Enhanced with complete data export
 """
 
 import os
@@ -47,17 +47,17 @@ class Tester:
 		# 创建测试数据加载器
 		self._create_test_loader()
 
-		# 结果存储
+		# 结果存储 - Enhanced with raw data and metadata
 		self.results = {
 			'predictions': [],
 			'labels': [],
 			'probabilities': [],
-			'metadata': []
+			'raw_data': [],  # 原始数据
+			'metadata': []    # 元数据
 		}
 
 	def _load_checkpoint(self, checkpoint_path: str):
 		"""加载模型检查点"""
-		# 修改这一行，添加 weights_only=False
 		checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 		self.model.load_state_dict(checkpoint['model_state_dict'])
 		self.model.eval()
@@ -88,14 +88,14 @@ class Tester:
 			pin_memory=self.config.training.pin_memory
 		)
 
-		# 保存原始数据用于可视化
+		# 保存原始数据用于可视化和导出
 		with open(self.config.data.test_data_path, 'rb') as f:
 			self.raw_test_data = pickle.load(f)
 
 		logger.info(f"Test dataset loaded: {len(test_dataset)} samples")
 
 	def test(self):
-		"""执行测试"""
+		"""执行测试 - Enhanced to collect all data"""
 		logger.info("Starting model testing...")
 
 		self.model.eval()
@@ -103,9 +103,16 @@ class Tester:
 		all_predictions = []
 		all_labels = []
 		all_probabilities = []
+		all_raw_data = []
+		all_metadata = []
+
+		# 数据索引计数器
+		data_idx = 0
 
 		with torch.no_grad():
 			for batch_idx, batch in enumerate(tqdm(self.test_loader, desc="Testing")):
+				batch_size = batch['label'].size(0)
+
 				# 移动数据到设备
 				for key in batch:
 					batch[key] = batch[key].to(self.device)
@@ -119,16 +126,71 @@ class Tester:
 				predictions = torch.argmax(logits, dim=1)
 
 				# 收集结果
-				all_predictions.extend(predictions.cpu().numpy())
-				all_labels.extend(labels.cpu().numpy())
-				all_probabilities.extend(probabilities.cpu().numpy())
+				batch_predictions = predictions.cpu().numpy()
+				batch_labels = labels.cpu().numpy()
+				batch_probabilities = probabilities.cpu().numpy()
+
+				all_predictions.extend(batch_predictions)
+				all_labels.extend(batch_labels)
+				all_probabilities.extend(batch_probabilities)
+
+				# 收集原始数据和元数据
+				for i in range(batch_size):
+					if data_idx < len(self.raw_test_data):
+						raw_sample = self.raw_test_data[data_idx]
+
+						# 构建完整的数据记录
+						data_record = {
+							# 原始CNR数据
+							's2w_current': raw_sample['s2w_current'],
+							's1c_current': raw_sample['s1c_current'],
+							'diff_current': raw_sample['diff_current'],
+							's2w_sequence': raw_sample['s2w_sequence'],
+							's1c_sequence': raw_sample['s1c_sequence'],
+							'diff_sequence': raw_sample['diff_sequence'],
+
+							# 位置数据
+							'station_position': raw_sample['station_position'],
+							'satellite_position': raw_sample['satellite_position'],
+
+							# 时间数据
+							'local_time': raw_sample['local_time'],
+							'timestamp': raw_sample['timestamp'] if 'timestamp' in raw_sample else None,
+
+							# 卫星信息
+							'satellite_id': raw_sample['satellite_id'],
+							'satellite_prn': raw_sample['satellite_prn'],
+
+							# 其他信息
+							'elevation': raw_sample.get('elevation', None)
+						}
+
+						# 元数据
+						metadata = {
+							'index': data_idx,
+							'batch_idx': batch_idx,
+							'in_batch_idx': i,
+							'true_label': int(batch_labels[i]),
+							'predicted_label': int(batch_predictions[i]),
+							'prediction_probability': float(batch_probabilities[i, 1]),  # Flex Power开启的概率
+							'confidence': float(np.max(batch_probabilities[i])),
+							'is_correct': int(batch_labels[i] == batch_predictions[i])
+						}
+
+						all_raw_data.append(data_record)
+						all_metadata.append(metadata)
+
+					data_idx += 1
 
 		# 保存结果
 		self.results['predictions'] = np.array(all_predictions)
 		self.results['labels'] = np.array(all_labels)
 		self.results['probabilities'] = np.array(all_probabilities)
+		self.results['raw_data'] = all_raw_data
+		self.results['metadata'] = all_metadata
 
 		logger.info("Testing completed!")
+		logger.info(f"Collected {len(all_raw_data)} samples with complete data")
 
 	def evaluate(self) -> Dict:
 		"""评估模型性能"""
@@ -229,6 +291,7 @@ class Tester:
 		"""分析错误案例"""
 		predictions = self.results['predictions']
 		labels = self.results['labels']
+		metadata = self.results['metadata']
 
 		# 找出错误的索引
 		errors = predictions != labels
@@ -252,27 +315,29 @@ class Tester:
 		logger.info("\nError Examples:")
 		for i in range(min(num_examples, len(error_indices))):
 			idx = error_indices[i]
-			sample = self.raw_test_data[idx]
+			sample = self.results['raw_data'][idx]
+			meta = metadata[idx]
 
 			logger.info(f"\nExample {i + 1}:")
 			logger.info(f"  Satellite: {sample['satellite_prn']}")
-			logger.info(f"  True Label: {labels[idx]} (Flex Power {'ON' if labels[idx] else 'OFF'})")
-			logger.info(f"  Predicted: {predictions[idx]} (Flex Power {'ON' if predictions[idx] else 'OFF'})")
-			logger.info(f"  Confidence: {self.results['probabilities'][idx, predictions[idx]]:.3f}")
+			logger.info(f"  True Label: {meta['true_label']} (Flex Power {'ON' if meta['true_label'] else 'OFF'})")
+			logger.info(f"  Predicted: {meta['predicted_label']} (Flex Power {'ON' if meta['predicted_label'] else 'OFF'})")
+			logger.info(f"  Confidence: {meta['confidence']:.3f}")
 			logger.info(f"  S2W CNR: {sample['s2w_current']:.2f}")
 			logger.info(f"  S1C CNR: {sample['s1c_current']:.2f}")
 			logger.info(f"  Diff CNR: {sample['diff_current']:.2f}")
-			logger.info(f"  Elevation: {sample.get('elevation', 'N/A'):.1f}°")
+			if sample['elevation'] is not None:
+				logger.info(f"  Elevation: {sample['elevation']:.1f}°")
 
 	def save_results(self, output_dir: str):
-		"""保存测试结果"""
+		"""保存测试结果 - Enhanced version"""
 		os.makedirs(output_dir, exist_ok=True)
 
-		# 保存预测结果
+		# 保存完整的预测结果（包含原始数据和元数据）
 		results_path = os.path.join(output_dir, 'test_results.pkl')
 		with open(results_path, 'wb') as f:
 			pickle.dump(self.results, f)
-		logger.info(f"Results saved to {results_path}")
+		logger.info(f"Complete results saved to {results_path}")
 
 		# 保存评估指标
 		metrics = self.evaluate()
@@ -291,6 +356,28 @@ class Tester:
 		# 生成测试报告
 		self._generate_report(output_dir, metrics)
 
+		# 保存MATLAB兼容的数据格式
+		self._save_matlab_compatible_data(output_dir)
+
+	def _save_matlab_compatible_data(self, output_dir: str):
+		"""保存MATLAB兼容的数据格式"""
+		matlab_data = {
+			'predictions': self.results['predictions'].tolist(),
+			'labels': self.results['labels'].tolist(),
+			'probabilities': self.results['probabilities'].tolist(),
+			's2w_current': [d['s2w_current'] for d in self.results['raw_data']],
+			's1c_current': [d['s1c_current'] for d in self.results['raw_data']],
+			'diff_current': [d['diff_current'] for d in self.results['raw_data']],
+			'satellite_prn': [d['satellite_prn'] for d in self.results['raw_data']],
+			'elevation': [d['elevation'] if d['elevation'] is not None else -999 for d in self.results['raw_data']],
+			'metadata': self.results['metadata']
+		}
+
+		matlab_path = os.path.join(output_dir, 'matlab_data.pkl')
+		with open(matlab_path, 'wb') as f:
+			pickle.dump(matlab_data, f)
+		logger.info(f"MATLAB-compatible data saved to {matlab_path}")
+
 	def _generate_report(self, output_dir: str, metrics: Dict):
 		"""生成测试报告"""
 		report_path = os.path.join(output_dir, 'test_report.txt')
@@ -302,7 +389,8 @@ class Tester:
 
 			f.write(f"Test Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 			f.write(f"Model: {self.config.experiment_name} v{self.config.version}\n")
-			f.write(f"Test Samples: {len(self.results['labels'])}\n\n")
+			f.write(f"Test Samples: {len(self.results['labels'])}\n")
+			f.write(f"Complete Data Records: {len(self.results['raw_data'])}\n\n")
 
 			f.write("-" * 60 + "\n")
 			f.write("PERFORMANCE METRICS\n")
@@ -369,6 +457,7 @@ def main():
 	tester.save_results(output_dir)
 
 	logger.info(f"\nAll results saved to: {output_dir}")
+	logger.info("You can now use the MATLAB script to visualize the results.")
 
 
 if __name__ == "__main__":
