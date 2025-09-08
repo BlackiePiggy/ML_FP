@@ -18,7 +18,7 @@ function GPS_Data_Analyzer
     data_storage.annotation_mode = false;
     
     % 创建主窗口
-    fig = figure('Name', 'GPS数据时序分析器', 'Position', [0, 0, 1600, 900], ...
+    fig = figure('Name', 'GPS数据时序分析器', 'Position', [50, 100, 1600, 900], ...
                  'MenuBar', 'none', 'ToolBar', 'figure', 'Resize', 'on');
     
     % 创建UI控件
@@ -99,7 +99,7 @@ function createUI(fig)
 
     % 四个选择子区：三个选择框 + 一个参数控制 + 加载按钮区
     row_gap = 0.02;
-    load_area_h = 0.12; % 加载按钮区域高度
+    load_area_h = 0.2; % 加载按钮区域高度
     param_area_h = 0.08; % 参数选择区域高度
     select_area_h = (1 - load_area_h - param_area_h - 5*row_gap) / 3; % 三个选择框均分
 
@@ -295,9 +295,16 @@ function createUI(fig)
     % 保存图窗句柄，供其它函数使用
     data_storage.fig = fig;
     
-    % 数据游标：一定要把 figure 句柄传给 datacursormode
+    % 数据游标：绑定 UpdateFcn，并关闭“吸附到数据点”
     data_storage.dcm = datacursormode(data_storage.fig);
     set(data_storage.dcm, 'UpdateFcn', @dataCursorUpdateFcn);
+    
+    % 关键：关闭吸附（不同版本 MATLAB 属性名可能略有差异）
+    try
+        set(data_storage.dcm, 'SnapToDataVertex', 'off');  % 老版 datacursormode
+    catch
+    end
+    
     datacursormode(data_storage.fig, 'on');
 
     % 其它初始化
@@ -308,114 +315,64 @@ end
 
 
 function txt = dataCursorUpdateFcn(~, event_obj)
-    % 从被拾取的散点图句柄回溯到原始表行，读取原始 time_utc（含年月日）与 t_abs
     global data_storage;
-    
-    h = get(event_obj, 'Target');   % 被点击的散点图句柄
-    idx = [];                       % 该点在散点中的索引
-    if isprop(event_obj, 'DataIndex')
-        try
-            idx = event_obj.DataIndex;
-        catch
-            idx = [];
-        end
-    end
-    
-    % 如果拿不到 DataIndex，退化为用最近点匹配
-    if isempty(idx)
-        try
-            pos = get(event_obj, 'Position');     % [x,y]（x可能是datetime）
-            xd  = get(h, 'XData');                % 绘图用的datetime/datenum
-            if isdatetime(xd)
-                xq = pos(1);
-                [~, idx] = min(abs(xd - xq));
-            else
-                xq = pos(1);
-                [~, idx] = min(abs(xd - xq));
-            end
-        catch
-            idx = 1;
-        end
-    end
-    
-    % 取回绑定在该散点图上的来源信息
-    file_idx = getappdata(h, 'file_idx');
-    row_idx  = getappdata(h, 'row_idx');
-    if isempty(file_idx) || isempty(row_idx) || idx < 1 || idx > numel(row_idx)
-        % 兜底：无法映射时仍显示当前位置
-        pos = get(event_obj, 'Position');
-        if isdatetime(pos(1))
-            time_dt = pos(1);
+    h   = get(event_obj, 'Target');      % 当前 DataTip 作用的散点
+    pos = get(event_obj, 'Position');    % [x, y]，x 可能是 datenum/小数天 或 datetime
+
+    % 取该散点预先绑定的 DOY 基准日期（UTC日零点）
+    base_date = getappdata(h, 'base_date');
+    if isempty(base_date)
+        % 兜底：从本系列的 x_plot 推断（通常不会走到）
+        x_plot = getappdata(h, 'x_plot');
+        if isdatetime(x_plot)
+            if isempty(x_plot.TimeZone), x_plot.TimeZone = 'UTC'; end
+            base_date = dateshift(min(x_plot), 'start', 'day');
         else
-            time_dt = datetime(pos(1), 'ConvertFrom','datenum', 'TimeZone','UTC');
+            base_date = datetime(1970,1,1,'TimeZone','UTC');
         end
-        time_abs = posixtime(time_dt);
-        y_val = pos(2);
-        param_idx = get(data_storage.param_dropdown, 'Value');
-        param_names = get(data_storage.param_dropdown, 'String');
-        param_name = param_names{param_idx};
-        txt = {['时间: ', datestr(time_dt, 'yyyy-mm-dd HH:MM:SS')], ...
-               [param_name, ': ', num2str(y_val, '%.3f')], ...
-               ['绝对秒: ', num2str(time_abs, '%.3f')]};
-        data_storage.last_cursor_point = struct('time_dt', time_dt, 'time_abs', time_abs, 'value', y_val, 'target', h);
-        if isprop(h,'DisplayName') && ~isempty(get(h,'DisplayName'))
-            txt{end+1} = ['数据源: ', get(h,'DisplayName')];
-        end
-        txt{end+1} = '点击起始点/结束点按钮进行标注';
-        return;
     end
-    
-    % 映射到原表的真实行
-    row = row_idx(idx);
-    file_info  = data_storage.data{file_idx};
-    T          = file_info.data;
-    
-    % 原始时间：严格取自原始 data 表
-    time_dt = T.time_utc(row);
-    if isempty(time_dt.TimeZone)
-        time_dt.TimeZone = 'UTC';
-    end
-    if ismember('t_abs', T.Properties.VariableNames)
-        time_abs = double(T.t_abs(row));
+
+    % 从 DataTip 的横坐标提取“当日时分秒”
+    xq = pos(1);
+    if isdatetime(xq)
+        % 若 DataTip 给的是 datetime，直接取其中的“timeofday”
+        if isempty(xq.TimeZone), xq.TimeZone = 'UTC'; else, xq = datetime(xq,'TimeZone','UTC'); end
+        tod = timeofday(xq);                % duration
     else
-        time_abs = posixtime(time_dt);
+        % 多数情况下 xq 是“小数天”（如 0.229xx 表示当天 05:30:xx）
+        % 用小数天转为 duration（时分秒）；即使 xq 是完整 datenum，也只取小数部分做当日时刻
+        tod = days(rem(double(xq), 1));     % 只保留当日的小数部分 -> duration
     end
-    
-    % 取当前参数的数值（与图上 value 一致）
-    param_idx = get(data_storage.param_dropdown, 'Value');
-    param_names = get(data_storage.param_dropdown, 'String');
-    param_name = param_names{param_idx};
-    y_val = NaN;
-    if ismember(param_name, T.Properties.VariableNames)
-        y_val = T.(param_name)(row);
-    else
-        % 兜底：用图上 y
-        pos = get(event_obj, 'Position');
-        y_val = pos(2);
-    end
-    
-    % 更新 last_cursor_point（后续标注都用这里的 time_abs/time_dt）
+
+    % 拼成“正确的绝对时间”（UTC）
+    time_dt  = base_date + tod;             % base_date 是当日 00:00:00
+    time_abs = posixtime(time_dt);          % 绝对秒（后续比较/导出仍用它）
+
+    % y 值：就用 DataTip 的 y（不吸附）
+    y_val = double(pos(2));
+
+    % 缓存“最后一次 DataTip 选中”的点，供起止点按钮取用
     data_storage.last_cursor_point = struct( ...
-        'time_dt', time_dt, ...
-        'time_abs', time_abs, ...
-        'value', y_val, ...
-        'target', h ...
-    );
-    
-    % 组装显示文本
-    txt = {['时间: ', datestr(time_dt, 'yyyy-mm-dd HH:MM:SS')], ...
-           [param_name, ': ', num2str(y_val, '%.3f')], ...
-           ['绝对秒: ', num2str(time_abs, '%.3f')]};
-    if isprop(h,'DisplayName') && ~isempty(get(h,'DisplayName'))
-        txt{end+1} = ['数据源: ', get(h,'DisplayName')];
-    end
-    txt{end+1} = '点击起始点/结束点按钮进行标注';
+        'time_dt',  time_dt, ...
+        'time_abs', double(time_abs), ...
+        'value',    y_val, ...
+        'target',   h);
+
+    % DataTip 显示文字（可按需精简）
+    % 注意：这里只显示到秒；若你有毫秒，可以把格式改成 'yyyy-mm-dd HH:MM:SS.FFF'
+    txt = { ...
+        ['时间: ', datestr(time_dt, 'yyyy-mm-dd HH:MM:SS')], ...
+        ['值: ', num2str(y_val, '%.3f')], ...
+        ['绝对秒: ', num2str(time_abs, '%.3f')], ...
+        '（此时间即用于设为起始/结束）' ...
+    };
 end
 
 function setStartPoint(~, ~)
     global data_storage;
     if isempty(data_storage.last_cursor_point)
-        msgbox('请先使用数据游标选择一个数据点！', '提示', 'warn');
+        % 不弹窗，只在面板提示
+        set(data_storage.annotation_info,'String','请先在图上用数据提示选择一个时间点（拖动后按 Enter 最稳）。');
         return;
     end
     data_storage.current_start_point = data_storage.last_cursor_point;
@@ -434,7 +391,7 @@ end
 function setEndPoint(~, ~)
     global data_storage;
     if isempty(data_storage.last_cursor_point)
-        msgbox('请先使用数据游标选择一个数据点！', '提示', 'warn');
+        set(data_storage.annotation_info,'String','请先在图上用数据提示选择一个时间点。');
         return;
     end
     data_storage.current_end_point = data_storage.last_cursor_point;
@@ -454,42 +411,35 @@ end
 function annotateRegion(label)
     global data_storage;
     if isempty(data_storage.current_start_point) || isempty(data_storage.current_end_point)
-        msgbox('请先选择起始点和结束点！', '提示', 'warn');
+        set(data_storage.annotation_info,'String','请先设置起始点和结束点，再进行标注。');
         return;
     end
-    
-    % ---- 用绝对时间戳排序并存储 ----
+
     start_abs = min(data_storage.current_start_point.time_abs, data_storage.current_end_point.time_abs);
     end_abs   = max(data_storage.current_start_point.time_abs, data_storage.current_end_point.time_abs);
-    % 同步保存可视化用的 datetime（仅展示，不用于比较）
-    start_dt  = datetime(start_abs, 'ConvertFrom','posixtime', 'TimeZone','UTC');
-    end_dt    = datetime(end_abs,   'ConvertFrom','posixtime', 'TimeZone','UTC');
-    
+    start_dt  = datetime(start_abs,'ConvertFrom','posixtime','TimeZone','UTC');
+    end_dt    = datetime(end_abs,  'ConvertFrom','posixtime','TimeZone','UTC');
+
     start_target = data_storage.current_start_point.target;
     data_source = '';
-    if isprop(start_target, 'DisplayName') && ~isempty(get(start_target, 'DisplayName'))
-        data_source = get(start_target, 'DisplayName');
+    if isprop(start_target,'DisplayName') && ~isempty(get(start_target,'DisplayName'))
+        data_source = get(start_target,'DisplayName');
     end
-    
-    annotation = struct();
-    annotation.start_abs = start_abs;
-    annotation.end_abs   = end_abs;
-    annotation.start_dt  = start_dt;
-    annotation.end_dt    = end_dt;
-    annotation.label     = label;
-    annotation.data_source = data_source;
-    annotation.timestamp = now;
-    
+
+    annotation = struct('start_abs',start_abs,'end_abs',end_abs, ...
+                        'start_dt',start_dt,'end_dt',end_dt, ...
+                        'label',label,'data_source',data_source,'timestamp',now);
     data_storage.annotations{end+1} = annotation;
-    
-    msgbox(sprintf('标注完成！\n时间区间: %s 到 %s\n标签: %d\n数据源: %s', ...
-                  datestr(start_dt, 'yyyy-mm-dd HH:MM:SS'), ...
-                  datestr(end_dt,   'yyyy-mm-dd HH:MM:SS'), ...
-                  label, data_source), '标注成功', 'help');
-    
+
+    % 面板提示替代弹窗
+    set(data_storage.annotation_info,'String',sprintf( ...
+        '标注完成：[%s ~ %s]，label=%d，源=%s\n已添加标注 %d 个。', ...
+        datestr(start_dt,'yyyy-mm-dd HH:MM:SS'), ...
+        datestr(end_dt,'yyyy-mm-dd HH:MM:SS'), ...
+        label, data_source, numel(data_storage.annotations)));
+
     data_storage.current_start_point = [];
     data_storage.current_end_point   = [];
-    set(data_storage.annotation_info, 'String', sprintf('已添加标注 %d 个\n请继续选择新的时间区间', length(data_storage.annotations)));
     updateAnnotationDisplay();
 end
 
@@ -539,7 +489,7 @@ end
 function selectOutputFolder(~, ~)
     global data_storage;
     
-    folder_path = uigetdir('', '选择输出文件夹');
+    folder_path = uigetdir('E:\projects\ML_FP\data\3_labeled_raw_datasets\2024', '选择输出文件夹');
     if folder_path ~= 0
         data_storage.output_folder = folder_path;
         set(data_storage.output_path_text, 'String', ['输出路径: ', folder_path]);
@@ -548,74 +498,61 @@ end
 
 function exportAnnotatedData(~, ~)
     global data_storage;
-    
+
     if isempty(data_storage.data)
-        msgbox('请先加载数据！', '警告', 'warn');
+        set(data_storage.annotation_info,'String','未加载数据，无法导出。');
         return;
     end
     if isempty(data_storage.output_folder)
-        msgbox('请先选择输出文件夹！', '警告', 'warn');
+        set(data_storage.annotation_info,'String','未设置输出路径，请先选择输出文件夹。');
         return;
     end
-    
-    h_wait = waitbar(0, '正在导出标注数据...', 'Name', '导出进度');
-    try
-        for i = 1:length(data_storage.data)
-            waitbar(i/length(data_storage.data), h_wait, ...
-                   sprintf('处理文件 %d/%d: %s', i, length(data_storage.data), data_storage.data{i}.filename));
-            
-            file_info  = data_storage.data{i};
-            data_table = file_info.data;
 
-            % 确保有 t_abs（绝对秒）
-            if ~ismember('t_abs', data_table.Properties.VariableNames)
-                if ~isdatetime(data_table.time_utc)
-                    error('导出前缺少 t_abs 且 time_utc 不是 datetime，无法生成绝对时间戳。');
-                end
-                data_table.t_abs = posixtime(data_table.time_utc);
+    written = 0;
+    for i = 1:length(data_storage.data)
+        file_info  = data_storage.data{i};
+        data_table = file_info.data;
+
+        if ~ismember('t_abs', data_table.Properties.VariableNames)
+            if ~isdatetime(data_table.time_utc)
+                set(data_storage.annotation_info,'String','导出失败：time_utc 非 datetime，无法生成 t_abs。');
+                return;
             end
-            
-            % 默认 0
-            label_column = zeros(height(data_table), 1);
-            
-            % 应用标注（仅用绝对时间戳比较）
-            for j = 1:length(data_storage.annotations)
-                ann = data_storage.annotations{j};
-                % 若限定数据源，则过滤
-                expected_source = sprintf('%s-%s', file_info.station, file_info.satellite);
-                % if ~isempty(ann.data_source) && ~strcmp(ann.data_source, expected_source)
-                %     continue;
-                % end
-                % 用绝对秒比较
-                time_mask = data_table.t_abs >= ann.start_abs & data_table.t_abs <= ann.end_abs;
-                label_column(time_mask) = ann.label;
-            end
-            
-            data_table.label = label_column;
-            output_filename = fullfile(data_storage.output_folder, [file_info.filename, '.csv']);
-            writetable(data_table, output_filename);
+            data_table.t_abs = posixtime(data_table.time_utc);
         end
-        close(h_wait);
-        msgbox(sprintf('导出完成！\n已处理 %d 个文件\n输出路径: %s', ...
-                      length(data_storage.data), data_storage.output_folder), '导出成功', 'help');
-    catch ME
-        if ishandle(h_wait), close(h_wait); end
-        msgbox(['导出出错: ', ME.message], '错误', 'error');
+
+        label_column = zeros(height(data_table),1);
+        for j = 1:length(data_storage.annotations)
+            ann = data_storage.annotations{j};
+            time_mask = data_table.t_abs >= ann.start_abs & data_table.t_abs <= ann.end_abs;
+            label_column(time_mask) = ann.label;
+        end
+        data_table.label = label_column;
+
+        output_filename = fullfile(data_storage.output_folder, [file_info.filename, '.csv']);
+        try
+            writetable(data_table, output_filename);
+            written = written + 1;
+        catch ME
+            fprintf('导出失败: %s, 错误: %s\n', output_filename, ME.message);
+        end
+        set(data_storage.annotation_info,'String',sprintf('导出进度：%d/%d -> %s', i, length(data_storage.data), file_info.filename));
+        drawnow;
     end
+
+    set(data_storage.annotation_info,'String',sprintf('导出完成。成功导出 %d/%d 个文件。输出目录：%s', ...
+        written, length(data_storage.data), data_storage.output_folder));
 end
 
 function clearAllAnnotations(~, ~)
     global data_storage;
-    
-    answer = questdlg('确定要清除所有标注吗？', '确认清除', '是', '否', '否');
-    if strcmp(answer, '是')
-        data_storage.annotations = {};
-        data_storage.current_start_point = [];
-        data_storage.current_end_point = [];
-        set(data_storage.annotation_info, 'String', '所有标注已清除');
-        updateAnnotationDisplay();
-    end
+    data_storage.annotations = {};
+    data_storage.current_start_point = [];
+    data_storage.current_end_point   = [];
+    set(data_storage.annotation_info,'String','所有标注已清除。');
+    updateAnnotationDisplay();
 end
+
 
 function toggleDataCursor(src, ~)
     global data_storage;
@@ -632,224 +569,165 @@ end
 
 function selectDataFolder(~, ~)
     global data_storage;
-    
-    % 选择数据文件夹
-    folder_path = uigetdir('', '选择包含GPS数据文件的文件夹');
+
+    folder_path = uigetdir('E:\projects\ML_FP\data\2_raw_datasets\2024', '选择包含GPS数据文件的文件夹');
     if folder_path == 0
+        set(data_storage.status_text,'String','未选择文件夹。');
         return;
     end
-    
-    % 存储文件夹路径
     data_storage.folder_path = folder_path;
-    
-    % 查找所有CSV文件
+
     csv_files = dir(fullfile(folder_path, '*.csv'));
-    
     if isempty(csv_files)
-        msgbox('所选文件夹中没有找到CSV文件！', '警告', 'warn');
+        set(data_storage.status_text,'String','所选文件夹中没有找到CSV文件。');
+        set(data_storage.scan_info,'String','测站: 0 | 卫星: 0 | DOY: 0');
+        set(data_storage.station_listbox,'String',{}); set(data_storage.satellite_listbox,'String',{}); set(data_storage.doy_listbox,'String',{});
         return;
     end
-    
-    % 解析文件名并分类
-    stations = {};
-    satellites = {};
-    doys = {};
-    valid_files = {};
-    
+
+    stations = {}; satellites = {}; doys = {}; valid_files = {};
     for i = 1:length(csv_files)
         filename = csv_files(i).name;
-        
-        % 解析文件名格式：station_satellite_yearDOY.csv
         if length(filename) >= 16 && strcmp(filename(end-3:end), '.csv')
             parts = split(filename, '_');
             if length(parts) >= 3
                 station = parts{1};
                 satellite = parts{2};
-                year_doy = parts{3}(1:end-4); % 去掉.csv
-                
-                if length(year_doy) == 7 % 2024153格式
-                    year = year_doy(1:4);
-                    doy = year_doy(5:7);
-                    
-                    stations{end+1} = station;
-                    satellites{end+1} = satellite;
-                    doys{end+1} = [year, '-', doy];
-                    valid_files{end+1} = fullfile(folder_path, filename);
+                year_doy = parts{3}(1:end-4);
+                if length(year_doy) == 7
+                    year = year_doy(1:4); doy = year_doy(5:7);
+                    stations{end+1} = station; %#ok<AGROW>
+                    satellites{end+1} = satellite; %#ok<AGROW>
+                    doys{end+1} = [year, '-', doy]; %#ok<AGROW>
+                    valid_files{end+1} = fullfile(folder_path, filename); %#ok<AGROW>
                 end
             end
         end
     end
-    
+
     if isempty(valid_files)
-        msgbox('没有找到符合命名规范的文件！文件名格式应为：测站_卫星_年DOY.csv', '警告', 'warn');
+        set(data_storage.status_text,'String','未找到符合命名规范的文件（测站_卫星_年DOY.csv）。');
+        set(data_storage.scan_info,'String','测站: 0 | 卫星: 0 | DOY: 0');
         return;
     end
-    
-    % 存储文件信息
+
     data_storage.files = valid_files;
-    data_storage.stations = unique(stations);
-    data_storage.satellites = unique(satellites);
-    data_storage.doys = unique(doys);
-    
-    % 排序显示
-    data_storage.stations = sort(data_storage.stations);
-    data_storage.satellites = sort(data_storage.satellites);
-    data_storage.doys = sort(data_storage.doys);
-    
-    % 更新UI列表
-    set(data_storage.station_listbox, 'String', data_storage.stations);
-    set(data_storage.satellite_listbox, 'String', data_storage.satellites);
-    set(data_storage.doy_listbox, 'String', data_storage.doys);
-    
-    % 更新状态
-    set(data_storage.status_text, 'String', sprintf('已扫描：%d个文件', length(valid_files)));
-    set(data_storage.scan_info, 'String', sprintf('测站: %d 个 | 卫星: %d 个 | DOY: %d 个', ...
-                        length(data_storage.stations), length(data_storage.satellites), length(data_storage.doys)));
-    
-    % 清空之前加载的数据
+    data_storage.stations = sort(unique(stations));
+    data_storage.satellites = sort(unique(satellites));
+    data_storage.doys = sort(unique(doys));
+
+    set(data_storage.station_listbox,'String',data_storage.stations);
+    set(data_storage.satellite_listbox,'String',data_storage.satellites);
+    set(data_storage.doy_listbox,'String',data_storage.doys);
+
+    set(data_storage.status_text,'String',sprintf('已扫描：%d 个文件', length(valid_files)));
+    set(data_storage.scan_info,'String',sprintf('测站: %d | 卫星: %d | DOY: %d', ...
+        length(data_storage.stations), length(data_storage.satellites), length(data_storage.doys)));
+
     data_storage.data = {};
-    set(data_storage.load_status_text, 'String', '请选择要加载的数据');
+    set(data_storage.load_status_text,'String','请选择要加载的数据');
 end
 
 function loadSelectedFiles(~, ~)
     global data_storage;
-    
+
     if isempty(data_storage.files)
-        msgbox('请先选择数据文件夹！', '警告', 'warn');
+        set(data_storage.load_status_text,'String','未选择数据文件夹。');
         return;
     end
-    
-    % 获取用户选择
-    selected_stations_idx = get(data_storage.station_listbox, 'Value');
-    selected_satellites_idx = get(data_storage.satellite_listbox, 'Value');
-    selected_doys_idx = get(data_storage.doy_listbox, 'Value');
-    
-    if isempty(selected_stations_idx) || isempty(selected_satellites_idx) || isempty(selected_doys_idx)
-        msgbox('请先选择要加载的测站、卫星和DOY！', '警告', 'warn');
+
+    sel_st = get(data_storage.station_listbox,'Value');
+    sel_sa = get(data_storage.satellite_listbox,'Value');
+    sel_do = get(data_storage.doy_listbox,'Value');
+    if isempty(sel_st) || isempty(sel_sa) || isempty(sel_do)
+        set(data_storage.load_status_text,'String','请先选择测站、卫星和DOY。');
         return;
     end
-    
-    selected_stations = data_storage.stations(selected_stations_idx);
-    selected_satellites = data_storage.satellites(selected_satellites_idx);
-    selected_doys = data_storage.doys(selected_doys_idx);
-    
-    % 过滤需要加载的文件
+
+    selected_stations  = data_storage.stations(sel_st);
+    selected_satellites= data_storage.satellites(sel_sa);
+    selected_doys      = data_storage.doys(sel_do);
+
     files_to_load = {};
     for i = 1:length(data_storage.files)
         filename = data_storage.files{i};
         [~, base_name, ~] = fileparts(filename);
         parts = split(base_name, '_');
-        
         if length(parts) >= 3
-            station = parts{1};
-            satellite = parts{2};
-            year_doy = parts{3};
-            year = year_doy(1:4);
-            doy = year_doy(5:7);
-            formatted_doy = [year, '-', doy];
-            
-            % 检查是否在选择列表中
-            if any(strcmp(selected_stations, station)) && ...
-               any(strcmp(selected_satellites, satellite)) && ...
-               any(strcmp(selected_doys, formatted_doy))
-                files_to_load{end+1} = filename;
+            station = parts{1}; satellite = parts{2}; year_doy = parts{3};
+            formatted_doy = [year_doy(1:4), '-', year_doy(5:7)];
+            if any(strcmp(selected_stations, station)) && any(strcmp(selected_satellites, satellite)) && any(strcmp(selected_doys, formatted_doy))
+                files_to_load{end+1} = filename; %#ok<AGROW>
             end
         end
     end
-    
+
     if isempty(files_to_load)
-        msgbox('没有找到符合选择条件的文件！', '警告', 'warn');
+        set(data_storage.load_status_text,'String','没有符合选择条件的文件。');
         return;
     end
-    
-    % 显示进度条
-    h_wait = waitbar(0, '正在加载选中的数据文件...', 'Name', '数据加载进度');
-    
+
     data_storage.data = {};
-    
-    try
-        for i = 1:length(files_to_load)
-            waitbar(i/length(files_to_load), h_wait, ...
-                   sprintf('加载文件 %d/%d: %s', i, length(files_to_load), ...
-                          basename(files_to_load{i})));
-            
-            filename = files_to_load{i};
-            
-            % 读取CSV文件
-            try
-                data = readtable(filename);
+    set(data_storage.load_status_text,'String',sprintf('开始加载 %d 个文件...', length(files_to_load))); drawnow;
 
-                % ---- 统一成 UTC datetime + 绝对时间戳（秒）----
-                if iscell(data.time_utc)
-                    data.time_utc = datetime(data.time_utc, 'InputFormat', 'yyyy-MM-dd HH:mm:ss.SSS', 'TimeZone','UTC');
-                elseif ischar(data.time_utc) || isstring(data.time_utc)
-                    data.time_utc = datetime(data.time_utc, 'InputFormat', 'yyyy-MM-dd HH:mm:ss.SSS', 'TimeZone','UTC');
-                elseif isdatetime(data.time_utc)
-                    if isempty(data.time_utc.TimeZone) || strcmp(data.time_utc.TimeZone,'')
-                        data.time_utc.TimeZone = 'UTC';
-                    else
-                        data.time_utc = datetime(data.time_utc, 'TimeZone','UTC');
-                    end
+    success = 0;
+    for i = 1:length(files_to_load)
+        filename = files_to_load{i};
+        set(data_storage.load_status_text,'String',sprintf('加载中 %d/%d: %s', i, length(files_to_load), basename(filename))); drawnow;
+        try
+            data = readtable(filename);
+
+            if iscell(data.time_utc)
+                data.time_utc = datetime(data.time_utc,'InputFormat','yyyy-MM-dd HH:mm:ss.SSS','TimeZone','UTC');
+            elseif ischar(data.time_utc) || isstring(data.time_utc)
+                data.time_utc = datetime(data.time_utc,'InputFormat','yyyy-MM-dd HH:mm:ss.SSS','TimeZone','UTC');
+            elseif isdatetime(data.time_utc)
+                if isempty(data.time_utc.TimeZone) || strcmp(data.time_utc.TimeZone,'')
+                    data.time_utc.TimeZone = 'UTC';
                 else
-                    error('time_utc 列类型不支持，请确认为字符串或 datetime。');
+                    data.time_utc = datetime(data.time_utc,'TimeZone','UTC');
                 end
-
-                % 绝对时间戳（秒，double）
-                if ~ismember('t_abs', data.Properties.VariableNames)
-                    data.t_abs = posixtime(data.time_utc);
-                else
-                    % 若已存在，确保是 double
-                    data.t_abs = double(data.t_abs);
-                end
-                % ----------------------------------------------
-
-                % 存储数据和文件信息
-                [~, base_name, ~] = fileparts(filename);
-                parts = split(base_name, '_');
-                
-                file_info = struct();
-                file_info.data = data;
-                file_info.station = parts{1};
-                file_info.satellite = parts{2};
-                file_info.year_doy = parts{3};
-                file_info.filename = base_name;
-                
-                data_storage.data{end+1} = file_info;
-                
-            catch ME
-                warning('读取文件失败: %s, 错误: %s', filename, ME.message);
+            else
+                set(data_storage.load_status_text,'String','time_utc 列类型不支持，请确认为字符串或 datetime。'); return;
             end
+
+            if ~ismember('t_abs', data.Properties.VariableNames)
+                data.t_abs = posixtime(data.time_utc);
+            else
+                data.t_abs = double(data.t_abs);
+            end
+
+            [~, base_name, ~] = fileparts(filename);
+            parts = split(base_name, '_');
+            file_info = struct();
+            file_info.data = data;
+            file_info.station = parts{1};
+            file_info.satellite = parts{2};
+            file_info.year_doy = parts{3};
+            file_info.filename = base_name;
+            data_storage.data{end+1} = file_info; %#ok<AGROW>
+            success = success + 1;
+        catch ME
+            % 控制台输出即可，不弹窗
+            fprintf('读取文件失败: %s, 错误: %s\n', filename, ME.message);
         end
-        
-        close(h_wait);
-        
-        % 更新状态
-        set(data_storage.load_status_text, 'String', sprintf('已加载: %d个文件', length(data_storage.data)));
-        
-        msgbox(sprintf('数据加载完成！\n成功加载 %d 个文件\n可以开始数据分析和标注', length(data_storage.data)), '加载完成', 'help');
-        
-    catch ME
-        if ishandle(h_wait)
-            close(h_wait);
-        end
-        msgbox(['数据加载出错: ', ME.message], '错误', 'error');
     end
+
+    set(data_storage.load_status_text,'String',sprintf('数据加载完成。成功: %d / 总计: %d', success, length(files_to_load)));
 end
+
 
 function clearLoadedData(~, ~)
     global data_storage;
-    
-    answer = questdlg('确定要清空已加载的数据吗？', '确认清空', '是', '否', '否');
-    if strcmp(answer, '是')
-        data_storage.data = {};
-        data_storage.annotations = {};
-        data_storage.current_start_point = [];
-        data_storage.current_end_point = [];
-        set(data_storage.load_status_text, 'String', '已清空数据');
-        set(data_storage.annotation_info, 'String', '请先用数据游标选择点，然后设置起始点和结束点');
-        clearPlots();
-    end
+    data_storage.data = {};
+    data_storage.annotations = {};
+    data_storage.current_start_point = [];
+    data_storage.current_end_point = [];
+    set(data_storage.load_status_text,'String','已清空数据');
+    set(data_storage.annotation_info,'String','请先用数据游标选择点，然后设置起始点和结束点');
+    clearPlots();
 end
+
 
 function name = basename(filepath)
     [~, name, ext] = fileparts(filepath);
@@ -865,96 +743,94 @@ end
 
 function plotTimeSeries(~, ~)
     global data_storage;
-    
+
     if isempty(data_storage.data)
-        msgbox('请先加载数据！', '警告', 'warn');
+        set(data_storage.stats_text,'String','未加载数据，无法绘图。');
         return;
     end
-    
+
     param_idx = get(data_storage.param_dropdown, 'Value');
     param_names = get(data_storage.param_dropdown, 'String');
     selected_param = param_names{param_idx};
-    
+
     cla(data_storage.axes);
     hold(data_storage.axes, 'on');
-    
+
     num_series = length(data_storage.data);
     colors = lines(num_series);
     legend_entries = {};
     data_values = [];
     total_points = 0;
-    
+
     try
         for i = 1:length(data_storage.data)
             file_info  = data_storage.data{i};
             data_table = file_info.data;
 
-            % 确保 time_utc 是 UTC datetime；确保 t_abs 存在
-            if ~isdatetime(data_table.time_utc)
-                error('数据 time_utc 不是 datetime，请检查加载逻辑。');
-            end
-            if isempty(data_table.time_utc.TimeZone)
-                data_table.time_utc.TimeZone = 'UTC';
-            end
-            if ~ismember('t_abs', data_table.Properties.VariableNames)
-                data_table.t_abs = posixtime(data_table.time_utc);
-            end
-            
+            if ~isdatetime(data_table.time_utc), set(data_storage.stats_text,'String','time_utc 非 datetime。'); return; end
+            if isempty(data_table.time_utc.TimeZone), data_table.time_utc.TimeZone = 'UTC'; end
+            if ~ismember('t_abs', data_table.Properties.VariableNames), data_table.t_abs = posixtime(data_table.time_utc); end
+
             if any(strcmp(data_table.Properties.VariableNames, selected_param))
                 times  = data_table.time_utc;
                 values = data_table.(selected_param);
-                
-                valid_idx = ~isnan(values) & isfinite(values);
+                valid_idx   = ~isnan(values) & isfinite(values);
                 times_plot  = times(valid_idx);
                 values_plot = values(valid_idx);
-                row_idx     = find(valid_idx);  % <- 保留“原表行号”映射
-                
+                row_idx     = find(valid_idx);
+
                 if ~isempty(times_plot)
-                    h = scatter(data_storage.axes, times_plot, values_plot, 36, colors(i, :), ...
-                                'filled', 'o', 'DisplayName', sprintf('%s-%s', file_info.station, file_info.satellite));
-                    
-                    % 绑定来源：这个散点对应哪个 file，以及对应原表中的哪些行
-                    setappdata(h, 'file_idx', i);
-                    setappdata(h, 'row_idx',  row_idx);
-                    
-                    legend_entries{end+1} = sprintf('%s-%s (%s)', file_info.station, file_info.satellite, file_info.year_doy);
+                    h = scatter(data_storage.axes, times_plot, values_plot, 36, colors(i,:), ...
+                        'filled','o','DisplayName',sprintf('%s-%s',file_info.station,file_info.satellite), ...
+                        'PickableParts','all','HitTest','on');
+
+                    yd  = file_info.year_doy;
+                    yr  = str2double(yd(1:4));
+                    doy = str2double(yd(5:7));
+                    base_date = datetime(yr,1,1,'TimeZone','UTC') + days(doy-1);
+                    setappdata(h,'base_date', base_date);
+
+                    setappdata(h,'file_idx',i);
+                    setappdata(h,'row_idx', row_idx);
+                    setappdata(h,'x_plot',  times_plot);
+                    setappdata(h,'y_plot',  values_plot);
+
+                    legend_entries{end+1} = sprintf('%s-%s (%s)', file_info.station, file_info.satellite, file_info.year_doy); %#ok<AGROW>
                     total_points = total_points + numel(values_plot);
-                    data_values = [data_values; values_plot];
+                    data_values  = [data_values; values_plot]; %#ok<AGROW>
                 end
             end
         end
-        
-        xlabel(data_storage.axes, '时间 (UTC)', 'FontSize', 12);
-        ylabel(data_storage.axes, selected_param, 'FontSize', 12);
-        title(data_storage.axes, sprintf('%s 时间序列分析', selected_param), 'FontSize', 14);
-        
-        if get(data_storage.grid_checkbox, 'Value'), grid(data_storage.axes, 'on'); else, grid(data_storage.axes, 'off'); end
-        if get(data_storage.legend_checkbox, 'Value') && ~isempty(legend_entries)
-            legend(data_storage.axes, legend_entries, 'Location', 'best', 'FontSize', 9);
+
+        xlabel(data_storage.axes,'时间 (UTC)','FontSize',12);
+        ylabel(data_storage.axes,selected_param,'FontSize',12);
+        title(data_storage.axes,sprintf('%s 时间序列分析',selected_param),'FontSize',14);
+
+        if get(data_storage.grid_checkbox,'Value'), grid(data_storage.axes,'on'); else, grid(data_storage.axes,'off'); end
+        if get(data_storage.legend_checkbox,'Value') && ~isempty(legend_entries)
+            legend(data_storage.axes, legend_entries, 'Location','best','FontSize',9);
         end
-        
-        if get(data_storage.cursor_checkbox, 'Value')
+
+        if get(data_storage.cursor_checkbox,'Value')
             if isempty(data_storage.fig) || ~ishandle(data_storage.fig)
-                data_storage.fig = ancestor(data_storage.axes, 'figure');
+                data_storage.fig = ancestor(data_storage.axes,'figure');
             end
-            datacursormode(data_storage.fig, 'on');
+            datacursormode(data_storage.fig,'on');
         end
-        
+
         if ~isempty(data_values)
-            stats_text = sprintf('数据点数: %d | 最小值: %.3f | 最大值: %.3f\n平均值: %.3f | 标准差: %.3f\n标注区域: %d 个', ...
-                               total_points, min(data_values), max(data_values), ...
-                               mean(data_values), std(data_values), length(data_storage.annotations));
+            stats_text = sprintf('数据点数: %d | 最小值: %.3f | 最大值: %.3f\n平均值: %.3f | 标准差: %.3f | 标注: %d 个', ...
+                total_points, min(data_values), max(data_values), mean(data_values), std(data_values), length(data_storage.annotations));
         else
             stats_text = '没有有效数据';
         end
-        set(data_storage.stats_text, 'String', stats_text);
-        
-        hold(data_storage.axes, 'off');
+        set(data_storage.stats_text,'String',stats_text);
+
+        hold(data_storage.axes,'off');
         updateAnnotationDisplay();
-        axis(data_storage.axes, 'tight');
-        
+        axis(data_storage.axes,'tight');
     catch ME
-        msgbox(['绘图出错: ', ME.message], '错误', 'error');
+        set(data_storage.stats_text,'String',['绘图出错：', ME.message]);
         fprintf('详细错误信息: %s\n', getReport(ME));
     end
 end
