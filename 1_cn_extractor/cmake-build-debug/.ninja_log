@@ -1,0 +1,10 @@
+# ninja log v6
+5	326	7789993494391116	CMakeFiles/snr_extract.dir/src/log.cpp.obj	f2265c8fbd58fe47
+7	809	7789993494411121	CMakeFiles/snr_extract.dir/src/utils.cpp.obj	7fcb650a5b83c80
+1	821	7789993494351123	CMakeFiles/snr_extract.dir/src/main.cpp.obj	e0e2c5113e5debc7
+13	845	7789993494471108	CMakeFiles/snr_extract.dir/third_party/RTKLIB/src/preceph.c.obj	c0b92e75b1e9ad
+12	940	7789993494461110	CMakeFiles/snr_extract.dir/third_party/RTKLIB/src/rinex.c.obj	2d368188b9c7aa44
+10	1013	7789993494441116	CMakeFiles/snr_extract.dir/third_party/RTKLIB/src/rtkcmn.c.obj	3c489e7f702103f9
+4	1769	7789993494371096	CMakeFiles/snr_extract.dir/src/config.cpp.obj	437e31c21fc2ce8d
+8	1895	7789993494421116	CMakeFiles/snr_extract.dir/src/rnx_extract.cpp.obj	5f6e832f613c0bd0
+1899	2220	7789993513327211	snr_extract.exe	2a8cde93baf59697
