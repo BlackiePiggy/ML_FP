@@ -176,45 +176,6 @@ def calculate_azimuth_elevation_enhanced(rec_x, rec_y, rec_z, sat_x, sat_y, sat_
 
     return azimuth, elevation, slant_range
 
-
-def get_historical_values_enhanced(df, current_idx, column, n_epochs=10):
-    """增强版历史数据提取，支持插值填充"""
-    history = []
-    valid_values = []
-    valid_indices = []
-
-    # 收集有效的历史值
-    for i in range(min(n_epochs * 2, current_idx)):
-        idx = current_idx - (i + 1)
-        if idx >= 0:
-            value = df.iloc[idx][column]
-            if not pd.isna(value) and value != -1:
-                valid_values.append(value)
-                valid_indices.append(i)
-
-    # 生成历史序列
-    for i in range(n_epochs):
-        idx = current_idx - (i + 1)
-        if idx >= 0:
-            value = df.iloc[idx][column]
-            if pd.isna(value) or value == -1:
-                # 尝试插值
-                if len(valid_values) >= 2 and i in range(min(valid_indices), max(valid_indices)):
-                    try:
-                        interpolated = np.interp(i, valid_indices[::-1], valid_values[::-1])
-                        history.append(float(interpolated))
-                    except Exception:
-                        history.append(-1)
-                else:
-                    history.append(-1)
-            else:
-                history.append(float(value))
-        else:
-            history.append(-1)
-
-    return history
-
-
 def process_station_satellite_batch(args):
     """
     批处理单个测站-卫星组合的数据（用于多进程）
@@ -227,7 +188,8 @@ def process_station_satellite_batch(args):
     decimal_places = int(config.get('output', 'decimal_places', fallback=6))
 
     # 去掉测站名称的后缀数字（如 abpo1070 -> abpo）
-    station_name = ''.join([c for c in station if not c.isdigit()])
+    # station_name取前4个字母
+    station_name = ''.join(station[:4].lower())
 
     output_data = []
     group_df = group_df.reset_index(drop=True)
