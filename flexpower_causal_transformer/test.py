@@ -23,6 +23,7 @@ from config import Config
 from model import create_model
 from train import FlexPowerDataset
 from torch.utils.data import DataLoader
+import pandas as pd
 
 # 设置日志
 logging.basicConfig(
@@ -330,33 +331,74 @@ class Tester:
 				logger.info(f"  Elevation: {sample['elevation']:.1f}°")
 
 	def save_results(self, output_dir: str):
-		"""保存测试结果 - Enhanced version"""
+		"""保存测试结果（含逐卫星 + 总体指标、可视化图表、报告、MATLAB兼容数据）"""
+		import csv
+
 		os.makedirs(output_dir, exist_ok=True)
 
-		# 保存完整的预测结果（包含原始数据和元数据）
+		# 1) 保存完整的预测结果（包含原始数据和元数据）
 		results_path = os.path.join(output_dir, 'test_results.pkl')
 		with open(results_path, 'wb') as f:
 			pickle.dump(self.results, f)
 		logger.info(f"Complete results saved to {results_path}")
 
-		# 保存评估指标
-		metrics = self.evaluate()
-		metrics_path = os.path.join(output_dir, 'evaluation_metrics.json')
-		with open(metrics_path, 'w') as f:
-			json.dump(metrics, f, indent=2)
-		logger.info(f"Metrics saved to {metrics_path}")
+		# 2) 保存逐卫星 + 总体评估指标
+		eval_all = self.evaluate_per_satellites()
 
-		# 保存可视化图表
+		# JSON
+		metrics_path = os.path.join(output_dir, 'evaluation_metrics_by_satellite.json')
+		with open(metrics_path, 'w') as f:
+			json.dump(eval_all, f, indent=2)
+		logger.info(f"Per-satellite + overall metrics saved to {metrics_path}")
+
+		# CSV
+		csv_path = os.path.join(output_dir, 'evaluation_metrics_by_satellite.csv')
+		with open(csv_path, 'w', newline='') as f:
+			writer = csv.writer(f)
+			writer.writerow([
+				'satellite',
+				'accuracy', 'precision', 'recall', 'f1', 'roc_auc',
+				'tn', 'fp', 'fn', 'tp'
+			])
+			# per-satellite
+			for sat, m in sorted(eval_all['per_satellite'].items()):
+				cm = np.array(m['confusion_matrix'])
+				tn, fp, fn, tp = cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
+				writer.writerow([
+					sat,
+					m.get('accuracy', None),
+					m.get('precision', None),
+					m.get('recall', None),
+					m.get('f1', None),
+					m.get('roc_auc', None),
+					tn, fp, fn, tp
+				])
+			# overall
+			M = eval_all['overall']
+			cm = np.array(M['confusion_matrix'])
+			tn, fp, fn, tp = cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
+			writer.writerow([
+				'OVERALL',
+				M.get('accuracy', None),
+				M.get('precision', None),
+				M.get('recall', None),
+				M.get('f1', None),
+				M.get('roc_auc', None),
+				tn, fp, fn, tp
+			])
+		logger.info(f"Per-satellite + overall metrics CSV saved to {csv_path}")
+
+		# 3) 保存总体可视化图表（混淆矩阵 & ROC）
 		cm_path = os.path.join(output_dir, 'confusion_matrix.png')
 		self.plot_confusion_matrix(cm_path)
 
 		roc_path = os.path.join(output_dir, 'roc_curve.png')
 		self.plot_roc_curve(roc_path)
 
-		# 生成测试报告
-		self._generate_report(output_dir, metrics)
+		# 4) 生成测试报告（仍基于总体指标）
+		self._generate_report(output_dir, eval_all['overall'])
 
-		# 保存MATLAB兼容的数据格式
+		# 5) 保存 MATLAB 兼容数据
 		self._save_matlab_compatible_data(output_dir)
 
 	def _save_matlab_compatible_data(self, output_dir: str):
@@ -425,6 +467,266 @@ class Tester:
 
 		logger.info(f"Test report saved to {report_path}")
 
+	def _station_key(self, station_pos, ndigits: int = 0) -> str:
+		"""把 station_position 向量转成可读 key，用四舍五入减少重复"""
+		try:
+			x, y, z = station_pos
+			return f"STN_{round(float(x), ndigits)}_{round(float(y), ndigits)}_{round(float(z), ndigits)}"
+		except Exception:
+			return "STN_UNKNOWN"
+
+	def _build_timeseries_df(self) -> pd.DataFrame:
+		"""把 self.results 汇总为 DataFrame，便于分组绘图"""
+		raw = self.results['raw_data']
+		meta = self.results['metadata']
+		if not raw or not meta:
+			raise ValueError("No results available. Run tester.test() first.")
+
+		rows = []
+		for r, m in zip(raw, meta):
+			ts = r.get('timestamp', None)
+			# 某些 pickle 里 timestamp 可能是 numpy.datetime64 或 str，这里统一转 datetime
+			if ts is None:
+				# 如果没有时间戳，用 local_time 拼
+				lt = r.get('local_time', None)
+				if lt is not None and len(lt) >= 6:
+					ts = datetime(int(lt[0]), int(lt[1]), int(lt[2]), int(lt[3]), int(lt[4]), int(lt[5]))
+			if isinstance(ts, str):
+				ts = pd.to_datetime(ts).to_pydatetime()
+			if not isinstance(ts, datetime):
+				# 最后兜底：用索引近似构建一个递增时间（不推荐，但保证不崩）
+				ts = datetime(2000, 1, 1)
+
+			station_pos = r.get('station_position', [None, None, None])
+			station = self._station_key(station_pos, ndigits=0)
+			sat = r.get('satellite_prn', 'UNK')
+			rows.append({
+				'timestamp': ts,
+				'date': ts.date(),
+				'station': station,
+				'satellite_prn': sat,
+				's2w': float(r.get('s2w_current', float('nan'))),
+				's1c': float(r.get('s1c_current', float('nan'))),
+				'diff': float(r.get('diff_current', float('nan'))),
+				'elev': r.get('elevation', None),
+				'true_label': int(m.get('true_label', 0)),
+				'pred_label': int(m.get('predicted_label', 0)),
+				'prob_on': float(m.get('prediction_probability', 0.0)),
+				'is_correct': bool(m.get('is_correct', 0)),
+			})
+		df = pd.DataFrame(rows)
+		df = df.sort_values('timestamp').reset_index(drop=True)
+		return df
+
+	def _plot_status_spans(self, ax, g):
+		"""
+		在坐标轴 ax 上用半透明矩形覆盖 TP/TN/FP/FN 区间。
+		g: 单个 (station, satellite, date) 分组后的 DataFrame（已按时间排序）
+		"""
+		import numpy as np
+		from matplotlib.patches import Patch
+
+		# 计算每个点的状态
+		t = g['true_label'].to_numpy().astype(int)
+		p = g['pred_label'].to_numpy().astype(int)
+		status = np.empty(len(g), dtype=object)
+		status[(t == 1) & (p == 1)] = 'TP'
+		status[(t == 0) & (p == 0)] = 'TN'
+		status[(t == 0) & (p == 1)] = 'FP'
+		status[(t == 1) & (p == 0)] = 'FN'
+
+		# 估计采样步长（秒），用于把区间右边界延伸半步，避免空隙
+		ts = pd.to_datetime(g['timestamp']).to_numpy()
+		if len(ts) >= 2:
+			diffs = (ts[1:] - ts[:-1]).astype('timedelta64[s]').astype(float)
+			step_sec = np.median(diffs) if np.isfinite(diffs).any() else 30.0
+		else:
+			step_sec = 30.0
+		half_step = pd.to_timedelta(step_sec / 2.0, unit='s')
+
+		# 合并相邻相同状态为区间
+		# 利用“状态变化”划分分段
+		boundaries = [0]
+		for i in range(1, len(status)):
+			if status[i] != status[i - 1]:
+				boundaries.append(i)
+		boundaries.append(len(status))  # 末尾
+
+		# 颜色与图例
+		color_map = {
+			'TP': '#4CAF50',  # 绿
+			'TN': '#90A4AE',  # 灰蓝
+			'FP': '#FF9800',  # 橙
+			'FN': '#F44336',  # 红
+		}
+		alpha = 0.20  # 透明度
+		used_labels = set()  # 避免重复图例
+
+		for b in range(len(boundaries) - 1):
+			i0, i1 = boundaries[b], boundaries[b + 1] - 1
+			st = status[i0]
+			if st is None:
+				continue
+			start = pd.to_datetime(g.iloc[i0]['timestamp'])
+			end = pd.to_datetime(g.iloc[i1]['timestamp']) + half_step
+
+			ax.axvspan(start, end, color=color_map[st], alpha=alpha, zorder=0,
+					   label=st if st not in used_labels else None)
+			used_labels.add(st)
+
+	def plot_all_timeseries(self, output_dir: str, draw_s2w_s1c: bool = False):
+		"""
+		为每个(测站-卫星-单日)绘制时间序列：
+		- 主曲线：S2W CNR
+		- 背景：用四种半透明颜色表示 TP/TN/FP/FN 覆盖区间
+		"""
+		os.makedirs(output_dir, exist_ok=True)
+		series_dir = os.path.join(output_dir, "series")
+		os.makedirs(series_dir, exist_ok=True)
+
+		df = self._build_timeseries_df()
+
+		# 分组：同一测站、同一卫星、同一天
+		group_cols = ['station', 'satellite_prn', 'date']
+		for (stn, sat, day), g in df.groupby(group_cols):
+			g = g.sort_values('timestamp').reset_index(drop=True)
+
+			fig, ax = plt.subplots(figsize=(12, 5))
+
+			# --- 背景着色：TP/TN/FP/FN ---
+			self._plot_status_spans(ax, g)
+
+			# --- 主曲线：S2W ---
+			ax.plot(g['timestamp'], g['s2w'], linewidth=1.8, label='S2W CNR', color='black', zorder=5)
+
+			# 可选：叠加 S1C / Diff（不建议同时太多）
+			if draw_s2w_s1c:
+				ax.plot(g['timestamp'], g['s1c'], linewidth=1.0, alpha=0.7, label='S1C CNR', zorder=6)
+				ax.plot(g['timestamp'], g['diff'], linewidth=1.0, alpha=0.6, label='Diff (S2W-S1C)', zorder=6)
+
+			# 坐标轴 & 样式
+			ax.set_title(f"{stn} - {sat} - {day}")
+			ax.set_xlabel("Time (UTC)")
+			ax.set_ylabel("CNR")
+
+			# 让背景矩形更明显：网格、边距
+			ax.grid(True, alpha=0.3)
+			ax.margins(y=0.10)
+
+			# 图例：合并来自 _plot_status_spans() 的四类标签 + 主曲线标签
+			handles, labels = ax.get_legend_handles_labels()
+			# 如果你想固定顺序，可手动重排；这里做一个去重保持出现顺序
+			uniq = {}
+			for h, l in zip(handles, labels):
+				if l and l not in uniq:
+					uniq[l] = h
+			ax.legend(uniq.values(), uniq.keys(), loc='upper left', ncol=2)
+
+			# 保存
+			safe_stn = str(stn).replace(':', '_').replace(' ', '_')
+			save_dir = os.path.join(series_dir, safe_stn)
+			os.makedirs(save_dir, exist_ok=True)
+			fname = f"{sat}_{day}.png"  # 仍用 YYYY-MM-DD 命名；如需 YYYYDOY 可改这里
+			save_path = os.path.join(save_dir, fname)
+			plt.savefig(save_path, dpi=200, bbox_inches='tight')
+			plt.close()
+
+		print(f"[OK] Saved all per-station-satellite daily plots under {series_dir}")
+
+	def _compute_metrics(self, y_true, y_pred, y_prob=None):
+		"""稳健计算分类指标；当某些指标不可用时返回 None。"""
+		from sklearn.metrics import (
+			accuracy_score, precision_score, recall_score, f1_score,
+			confusion_matrix, classification_report, roc_auc_score
+		)
+		metrics = {}
+		y_true = np.asarray(y_true)
+		y_pred = np.asarray(y_pred)
+
+		# 样本数过少或单一类别时的防守
+		unique_labels = np.unique(y_true)
+		cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+		metrics['confusion_matrix'] = cm.tolist()
+		metrics['accuracy'] = float(accuracy_score(y_true, y_pred))
+		try:
+			metrics['precision'] = float(precision_score(y_true, y_pred, zero_division=0))
+			metrics['recall'] = float(recall_score(y_true, y_pred, zero_division=0))
+			metrics['f1'] = float(f1_score(y_true, y_pred, zero_division=0))
+		except Exception:
+			metrics['precision'] = metrics['recall'] = metrics['f1'] = None
+
+		# 分类报告
+		try:
+			report = classification_report(
+				y_true, y_pred,
+				target_names=['No Flex Power', 'Flex Power'],
+				output_dict=True, zero_division=0
+			)
+		except Exception:
+			report = {}
+		metrics['classification_report'] = report
+
+		# AUC（需要 y_prob 且 y_true 同时包含 0/1 才能算）
+		if y_prob is not None and len(unique_labels) == 2:
+			try:
+				y_prob = np.asarray(y_prob)
+				metrics['roc_auc'] = float(roc_auc_score(y_true, y_prob))
+			except Exception:
+				metrics['roc_auc'] = None
+		else:
+			metrics['roc_auc'] = None
+
+		return metrics
+
+	def evaluate_per_satellites(self) -> Dict:
+		"""
+		按卫星PRN分组评估性能，并返回：
+		{
+		  "per_satellite": { "G01": {...}, "G02": {...}, ... },
+		  "overall": {...}
+		}
+		其中每个 {...} 都是 _compute_metrics 返回的指标字典。
+		"""
+		preds = self.results['predictions']
+		labels = self.results['labels']
+		probs = self.results['probabilities'][:, 1] if self.results['probabilities'] is not None else None
+		raw = self.results['raw_data']
+
+		# 对齐卫星PRN
+		sats = [d['satellite_prn'] for d in raw]
+		sats = np.asarray(sats)
+
+		per_sat = {}
+		for sat_id in sorted(set(sats)):
+			idx = np.where(sats == sat_id)[0]
+			y_true = labels[idx]
+			y_pred = preds[idx]
+			y_prob = probs[idx] if probs is not None else None
+			per_sat[sat_id] = self._compute_metrics(y_true, y_pred, y_prob)
+
+		# 总体
+		overall = self._compute_metrics(labels, preds, probs)
+
+		# 简要日志
+		logger.info("=" * 60)
+		logger.info("Per-Satellite Evaluation:")
+		for s in sorted(per_sat.keys()):
+			m = per_sat[s]
+			logger.info(
+				f"{s}: acc={m['accuracy']:.4f}, prec={m.get('precision', 0) if m.get('precision') is not None else 'NA'}, "
+				f"rec={m.get('recall', 0) if m.get('recall') is not None else 'NA'}, "
+				f"f1={m.get('f1', 0) if m.get('f1') is not None else 'NA'}, "
+				f"auc={m.get('roc_auc', 'NA')}")
+		logger.info("-" * 60)
+		logger.info(f"OVERALL: acc={overall['accuracy']:.4f}, prec={overall.get('precision', 'NA')}, "
+					f"rec={overall.get('recall', 'NA')}, f1={overall.get('f1', 'NA')}, auc={overall.get('roc_auc', 'NA')}")
+		logger.info("=" * 60)
+
+		return {
+			"per_satellite": per_sat,
+			"overall": overall
+		}
+
 
 def main():
 	"""主函数"""
@@ -447,7 +749,9 @@ def main():
 	tester.test()
 
 	# 评估结果
-	metrics = tester.evaluate()
+	def evaluate(self) -> Dict:
+		"""兼容旧接口：返回包含 per_satellite 和 overall 的指标字典。"""
+		return self.evaluate_per_satellites()
 
 	# 分析错误
 	tester.analyze_errors(num_examples=5)
@@ -455,6 +759,9 @@ def main():
 	# 保存结果
 	output_dir = os.path.join("test_results", datetime.now().strftime("%Y%m%d_%H%M%S"))
 	tester.save_results(output_dir)
+
+	# 生成“测站-卫星-单日”时间序列图
+	tester.plot_all_timeseries(output_dir, draw_s2w_s1c=False)  # 想同时画 S2W/S1C 则设 True
 
 	logger.info(f"\nAll results saved to: {output_dir}")
 	logger.info("You can now use the MATLAB script to visualize the results.")

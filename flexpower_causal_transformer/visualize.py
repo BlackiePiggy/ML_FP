@@ -387,7 +387,7 @@ def main():
 	# 绘制单颗卫星的时间序列
 	print("Plotting time series for satellite G01...")
 	visualizer.plot_time_series(
-		satellite_prn='G01',
+		satellite_prn='G03',
 		num_points=500,
 		save_path=os.path.join(output_dir, 'G01_time_series.png')
 	)

@@ -13,10 +13,10 @@ class DataConfig:
     # 数据路径
     data_root: str = "./data"
     raw_data_dir: str = field(default_factory=lambda: os.path.join("./data", "raw"))
-    processed_data_dir: str = field(default_factory=lambda: os.path.join("./data", "processed"))
-    train_data_path: str = field(default_factory=lambda: os.path.join("./data", "processed", "train_data.pkl"))
-    val_data_path: str = field(default_factory=lambda: os.path.join("./data", "processed", "val_data.pkl"))
-    test_data_path: str = field(default_factory=lambda: os.path.join("./data", "processed", "test_data.pkl"))
+    processed_data_dir: str = field(default_factory=lambda: os.path.join("../data", "4_raw_dataset"))
+    train_data_path: str = field(default_factory=lambda: os.path.join("../data", "4_raw_dataset", "train.pkl"))
+    val_data_path: str = field(default_factory=lambda: os.path.join("../data", "4_raw_dataset", "val.pkl"))
+    test_data_path: str = field(default_factory=lambda: os.path.join("../data", "4_raw_dataset", "test.pkl"))
 
     # 数据参数
     window_size: int = 5  # 前序窗口大小

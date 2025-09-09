@@ -111,7 +111,7 @@ def visualize_data(data):
 
 if __name__ == "__main__":
 	# 替换为你的pkl文件路径
-	pkl_file_path = "E:\\projects\\ML_FP\\flexpower_causal_transformer\\data\\processed\\test_data.pkl"
+	pkl_file_path = "E:\\projects\\ML_FP\\flexpower_causal_transformer\\test_results\\20250908_231352\\matlab_data.pkl"
 
 	# 加载pkl文件
 	data = load_pkl_file(pkl_file_path)
