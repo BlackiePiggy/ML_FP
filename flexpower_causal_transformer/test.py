@@ -110,6 +110,11 @@ class Tester:
 		# 数据索引计数器
 		data_idx = 0
 
+		# 在 Tester.test() 的 with torch.no_grad(): 循环前，插入一次取 batch 的检查
+		sample_batch = next(iter(self.test_loader))
+		print("angle_features in test batch:", sample_batch['angle_features'].shape,
+			  sample_batch['angle_features'].mean().item(), sample_batch['angle_features'].std().item())
+
 		with torch.no_grad():
 			for batch_idx, batch in enumerate(tqdm(self.test_loader, desc="Testing")):
 				batch_size = batch['label'].size(0)
@@ -141,6 +146,7 @@ class Tester:
 						raw_sample = self.raw_test_data[data_idx]
 
 						# 构建完整的数据记录
+						# 构建完整的数据记录
 						data_record = {
 							# 原始CNR数据
 							's2w_current': raw_sample['s2w_current'],
@@ -163,7 +169,11 @@ class Tester:
 							'satellite_prn': raw_sample['satellite_prn'],
 
 							# 其他信息
-							'elevation': raw_sample.get('elevation', None)
+							'elevation': raw_sample.get('elevation', None),
+							'azimuth': raw_sample.get('azimuth', None),  # <— 新增：方位角
+
+							# 名称（目前数据源没有，先占位；若将来预处理加入可直接填充）
+							'station_name': raw_sample.get('station_name', None)  # <— 新增：测站名称占位
 						}
 
 						# 元数据
@@ -412,6 +422,7 @@ class Tester:
 			'diff_current': [d['diff_current'] for d in self.results['raw_data']],
 			'satellite_prn': [d['satellite_prn'] for d in self.results['raw_data']],
 			'elevation': [d['elevation'] if d['elevation'] is not None else -999 for d in self.results['raw_data']],
+			'azimuth': [d['azimuth'] if d['azimuth'] is not None else -999 for d in self.results['raw_data']],  # 新增
 			'metadata': self.results['metadata']
 		}
 
@@ -476,7 +487,7 @@ class Tester:
 			return "STN_UNKNOWN"
 
 	def _build_timeseries_df(self) -> pd.DataFrame:
-		"""把 self.results 汇总为 DataFrame，便于分组绘图"""
+		"""把 self.results 汇总为 DataFrame，便于分组绘图（优先使用 station_name）"""
 		raw = self.results['raw_data']
 		meta = self.results['metadata']
 		if not raw or not meta:
@@ -485,21 +496,27 @@ class Tester:
 		rows = []
 		for r, m in zip(raw, meta):
 			ts = r.get('timestamp', None)
-			# 某些 pickle 里 timestamp 可能是 numpy.datetime64 或 str，这里统一转 datetime
 			if ts is None:
-				# 如果没有时间戳，用 local_time 拼
 				lt = r.get('local_time', None)
 				if lt is not None and len(lt) >= 6:
 					ts = datetime(int(lt[0]), int(lt[1]), int(lt[2]), int(lt[3]), int(lt[4]), int(lt[5]))
 			if isinstance(ts, str):
 				ts = pd.to_datetime(ts).to_pydatetime()
 			if not isinstance(ts, datetime):
-				# 最后兜底：用索引近似构建一个递增时间（不推荐，但保证不崩）
 				ts = datetime(2000, 1, 1)
 
-			station_pos = r.get('station_position', [None, None, None])
-			station = self._station_key(station_pos, ndigits=0)
+			# ✅ 优先用 station_name；没有则退回到坐标 key
+			station_name = r.get('station_name', None)
+			if station_name is None or str(station_name).strip() == "":
+				station_pos = r.get('station_position', [None, None, None])
+				station = self._station_key(station_pos, ndigits=0)
+			else:
+				station = str(station_name)
+
 			sat = r.get('satellite_prn', 'UNK')
+			elev = r.get('elevation', None)
+			azim = r.get('azimuth', None)  # 新增：方位角
+
 			rows.append({
 				'timestamp': ts,
 				'date': ts.date(),
@@ -508,7 +525,8 @@ class Tester:
 				's2w': float(r.get('s2w_current', float('nan'))),
 				's1c': float(r.get('s1c_current', float('nan'))),
 				'diff': float(r.get('diff_current', float('nan'))),
-				'elev': r.get('elevation', None),
+				'elev': float(elev) if elev is not None else np.nan,  # ✅ 统一为 float/NaN，便于判断缺失
+				'azim': float(azim) if azim is not None else np.nan,  # 新增：方位角
 				'true_label': int(m.get('true_label', 0)),
 				'pred_label': int(m.get('predicted_label', 0)),
 				'prob_on': float(m.get('prediction_probability', 0.0)),
@@ -577,56 +595,51 @@ class Tester:
 	def plot_all_timeseries(self, output_dir: str, draw_s2w_s1c: bool = False):
 		"""
 		为每个(测站-卫星-单日)绘制时间序列：
+		- 背景①：TP/TN/FP/FN 覆盖区间
+		- 背景②：灰色表示缺失高度角的时间段
 		- 主曲线：S2W CNR
-		- 背景：用四种半透明颜色表示 TP/TN/FP/FN 覆盖区间
 		"""
 		os.makedirs(output_dir, exist_ok=True)
 		series_dir = os.path.join(output_dir, "series")
 		os.makedirs(series_dir, exist_ok=True)
 
 		df = self._build_timeseries_df()
-
-		# 分组：同一测站、同一卫星、同一天
 		group_cols = ['station', 'satellite_prn', 'date']
+
 		for (stn, sat, day), g in df.groupby(group_cols):
 			g = g.sort_values('timestamp').reset_index(drop=True)
 
 			fig, ax = plt.subplots(figsize=(12, 5))
 
-			# --- 背景着色：TP/TN/FP/FN ---
+			# 背景①：TP/TN/FP/FN
 			self._plot_status_spans(ax, g)
 
-			# --- 主曲线：S2W ---
+			# 主曲线：S2W
 			ax.plot(g['timestamp'], g['s2w'], linewidth=1.8, label='S2W CNR', color='black', zorder=5)
 
-			# 可选：叠加 S1C / Diff（不建议同时太多）
 			if draw_s2w_s1c:
 				ax.plot(g['timestamp'], g['s1c'], linewidth=1.0, alpha=0.7, label='S1C CNR', zorder=6)
 				ax.plot(g['timestamp'], g['diff'], linewidth=1.0, alpha=0.6, label='Diff (S2W-S1C)', zorder=6)
 
-			# 坐标轴 & 样式
-			ax.set_title(f"{stn} - {sat} - {day}")
+			ax.set_title(f"{stn} - {sat} - {day}")  # ✅ stn 已是 station_name 或回退key
 			ax.set_xlabel("Time (UTC)")
 			ax.set_ylabel("CNR")
-
-			# 让背景矩形更明显：网格、边距
 			ax.grid(True, alpha=0.3)
 			ax.margins(y=0.10)
 
-			# 图例：合并来自 _plot_status_spans() 的四类标签 + 主曲线标签
+			# 图例去重
 			handles, labels = ax.get_legend_handles_labels()
-			# 如果你想固定顺序，可手动重排；这里做一个去重保持出现顺序
 			uniq = {}
 			for h, l in zip(handles, labels):
 				if l and l not in uniq:
 					uniq[l] = h
 			ax.legend(uniq.values(), uniq.keys(), loc='upper left', ncol=2)
 
-			# 保存
+			# 保存（用测站名称创建文件夹）
 			safe_stn = str(stn).replace(':', '_').replace(' ', '_')
 			save_dir = os.path.join(series_dir, safe_stn)
 			os.makedirs(save_dir, exist_ok=True)
-			fname = f"{sat}_{day}.png"  # 仍用 YYYY-MM-DD 命名；如需 YYYYDOY 可改这里
+			fname = f"{sat}_{day}.png"
 			save_path = os.path.join(save_dir, fname)
 			plt.savefig(save_path, dpi=200, bbox_inches='tight')
 			plt.close()
@@ -761,7 +774,7 @@ def main():
 	tester.save_results(output_dir)
 
 	# 生成“测站-卫星-单日”时间序列图
-	tester.plot_all_timeseries(output_dir, draw_s2w_s1c=False)  # 想同时画 S2W/S1C 则设 True
+	tester.plot_all_timeseries(output_dir, draw_s2w_s1c=True)  # 想同时画 S2W/S1C 则设 True
 
 	logger.info(f"\nAll results saved to: {output_dir}")
 	logger.info("You can now use the MATLAB script to visualize the results.")

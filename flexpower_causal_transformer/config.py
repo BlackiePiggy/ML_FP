@@ -55,6 +55,9 @@ class ModelConfig:
     transformer_dropout: float = 0.1
     transformer_dim_feedforward: int = 512
 
+    # 方位角和高度角
+    angle_encoding_dim: int = 16
+
     # 融合层参数
     fusion_layers: List[int] = field(default_factory=lambda: [512, 256])
     fusion_dropout: float = 0.3

@@ -228,15 +228,24 @@ class FlexPowerDetectionModel(nn.Module):
 			dropout=config.model.transformer_dropout
 		)
 
+		self.angle_encoder = nn.Sequential(
+			nn.Linear(4, 16),
+			nn.LayerNorm(16),
+			nn.ReLU(),
+			nn.Dropout(self.config.model.position_encoder_dropout)
+		)
+		self.angle_feat_dim = 16
+
 		# 3. Feature fusion layers
 		# Calculate total feature dimension
 		fusion_input_dim = (
-				3 +  # Current S2W, S1C, diff values
-				config.model.satellite_embedding_dim +  # Satellite embedding
-				config.model.position_encoder_layers[-1] +  # Position encoding
-				config.model.time_encoding_dim +  # Time encoding
-				self.cnn_extractor.output_dim +  # CNN features
-				self.transformer_extractor.output_dim  # Transformer features
+				3  # current S2W, S1C, diff
+				+ config.model.satellite_embedding_dim
+				+ config.model.position_encoder_layers[-1]
+				+ config.model.time_encoding_dim
+				+ self.cnn_extractor.output_dim
+				+ self.transformer_extractor.output_dim
+				+ self.angle_feat_dim  # <— 新增：角度特征维度
 		)
 
 		fusion_layers = []
@@ -308,6 +317,9 @@ class FlexPowerDetectionModel(nn.Module):
 		# Extract Transformer features
 		transformer_features = self.transformer_extractor(seq_data)
 
+		# Azumith and Elevation angles
+		angle_features = self.angle_encoder(batch['angle_features'])
+
 		# 6. Concatenate all features
 		all_features = torch.cat([
 			current_features,
@@ -315,7 +327,8 @@ class FlexPowerDetectionModel(nn.Module):
 			position_features,
 			time_features,
 			cnn_features,
-			transformer_features
+			transformer_features,
+			angle_features  # <— 新增
 		], dim=-1)
 
 		# 7. Feature fusion
@@ -438,7 +451,8 @@ if __name__ == "__main__":
 		'station_position': torch.randn(batch_size, 3),
 		'satellite_position': torch.randn(batch_size, 3),
 		'local_time': torch.randn(batch_size, 6),
-		'satellite_id': torch.randint(1, 33, (batch_size,))
+		'satellite_id': torch.randint(1, 33, (batch_size,)),
+		'angle_features': torch.randn(batch_size, 4)
 	}
 
 	# 前向传播

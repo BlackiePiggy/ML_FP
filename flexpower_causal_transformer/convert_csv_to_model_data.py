@@ -107,6 +107,7 @@ class CSVToModelConverter:
 
 				# 附加信息
 				'elevation': current['elevation'],
+				'azimuth': current['azimuth'],
 				'timestamp': current['datetime'],
 				'station_id': current['station_id'],
 				'epoch': current['epoch'],

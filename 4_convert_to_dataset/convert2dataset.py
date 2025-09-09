@@ -3,23 +3,13 @@
 
 """
 将 3_labeled_raw_datasets 中的标注CSV转为模型可用的数据集（与模拟生成器结构一致）
-- 训练集：所有 _2024154 ~ _2024159.csv
-- 测试集：所有 _2024153.csv
-- 验证集：默认从训练集中按比例随机划出（默认 10%）
+— 训练/测试划分、测站/DOY选择，全部由 config.py / config.ini 决定
 
-输出：
-4_processed_datasets/
-  ├─ train.pkl
-  ├─ val.pkl
-  ├─ test.pkl
-  └─ dataset_stats.pkl
-
-依赖：
-- pandas, numpy, tqdm
-- 本工程已有的 config.Config（用于读取 window_size 以及可选的输出目录）
+满足你的划分需求：
+- 测试集：cusv 测站的所有 DOY + 所有测站在 DOY=2024153 的数据
+- 训练集：其余数据（非 cusv 且 DOY ≠ 2024153）
 """
 
-import os
 import re
 import pickle
 from pathlib import Path
@@ -28,37 +18,13 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+import configparser
 
-# 若你的 Config 在别处，请调整导入路径
-from config import Config
-
-
-# ------------ 可调参数（也可直接用 Config） ------------
-# 原始数据根目录
-RAW_ROOT = Path(r"E:\projects\ML_FP\data\3_labeled_raw_datasets")
-# 输出目录（若 Config 中设有 processed_data_dir，会优先使用 Config）
-DEFAULT_OUT_DIR = Path(r"E:\projects\ML_FP\data\4_processed_datasets")
-
-# 仅保留的星座前缀（GPS: G，BDS/北斗: C）
-ALLOW_CONSTELLATIONS = ("G", "C")
-
-# 从训练集随机划出的验证集比例（设为 0 则不划分）
-VAL_SPLIT_RATIO = 0.10
-
-# -----------------------------------------------------
-
-
-DOY_TEST = "2024153"
-DOY_TRAIN_RANGE = set([f"20241{d:02d}" for d in range(54, 60)])  # 2024154~2024159
+from config import default_config, Config  # 改造后的 config.py
 
 FNAME_DOY_RE = re.compile(r".*_(\d{7})\.csv$", re.IGNORECASE)
 
-
 def parse_satellite_id(s: str) -> Tuple[int, str]:
-    """
-    'G01' -> (1, 'G01')
-    'C15' -> (15, 'C15')
-    """
     s = s.strip()
     prn = s
     try:
@@ -67,14 +33,15 @@ def parse_satellite_id(s: str) -> Tuple[int, str]:
         num = -1
     return num, prn
 
+def _station_from_fname(p: Path) -> str:
+    # e.g., cusv_G01_2024153.csv -> "cusv"
+    return p.name.split("_", 1)[0].lower()
 
-def row_to_sample(row: pd.Series,
-                  history: List[Dict],
-                  window_size: int) -> Dict:
+def row_to_sample(row: pd.Series, history: List[Dict], window_size: int) -> Dict:
     """
-    将一行数据（一个历元）+ 历史，拼装为与生成器一致的样本字典
+    与生成器一致的样本字典
     需要的列：
-      time_utc, satellite, rec_x/y/z, sat_x/y/z, S1C, S2W, S2W_S1C_diff, elevation, label
+      time_utc, satellite, rec_x/y/z, sat_x/y/z, S1C, S2W, S2W_S1C_diff, elevation, azimuth, label
     """
     timestamp = pd.to_datetime(row["time_utc"]).to_pydatetime()
 
@@ -83,11 +50,12 @@ def row_to_sample(row: pd.Series,
 
     s1c = float(row["S1C"])
     s2w = float(row["S2W"])
-    diff = float(row["S2W_S1C_diff"]) if pd.notna(row["S2W_S1C_diff"]) else (s2w - s1c)
-    elevation = float(row["elevation"]) if pd.notna(row["elevation"]) else np.nan
-    label = int(row["label"]) if pd.notna(row["label"]) else 0
+    diff = float(row["S2W_S1C_diff"]) if pd.notna(row.get("S2W_S1C_diff", np.nan)) else (s2w - s1c)
+    elevation = float(row["elevation"]) if pd.notna(row.get("elevation", np.nan)) else np.nan
+    azimuth = float(row["azimuth"]) if pd.notna(row.get("azimuth", np.nan)) else np.nan
+    label = int(row["label"]) if pd.notna(row.get("label", np.nan)) else 0
 
-    # 序列构造（与生成器一致：历史长度不足时在前端用当前值填充）
+    # 历史序列（不足时前端用当前值填充）
     if len(history) >= window_size:
         s2w_seq = [h["s2w_current"] for h in history[-window_size:]]
         s1c_seq = [h["s1c_current"] for h in history[-window_size:]]
@@ -107,6 +75,7 @@ def row_to_sample(row: pd.Series,
         "s2w_sequence": np.array(s2w_seq, dtype=float),
         "s1c_sequence": np.array(s1c_seq, dtype=float),
         "diff_sequence": np.array(diff_seq, dtype=float),
+        "station_name": str(row["station"]),
         "station_position": station_pos,
         "satellite_position": sat_pos,
         "local_time": np.array(
@@ -114,42 +83,68 @@ def row_to_sample(row: pd.Series,
              timestamp.hour, timestamp.minute, timestamp.second],
             dtype=int
         ),
-        "satellite_id": sat_num,         # 与生成器一致：G01 -> 1
-        "satellite_prn": sat_prn,        # e.g., 'G01'
+        "satellite_id": sat_num,      # G01 -> 1
+        "satellite_prn": sat_prn,     # 'G01'
         "label": label,
+        "azimuth": azimuth,
         "elevation": elevation,
         "timestamp": timestamp
     }
     return sample
 
+def _allowed_station(sta: str, split_cfg) -> bool:
+    sta = sta.lower()
+    wl = [s.lower() for s in split_cfg.station_whitelist] if split_cfg.station_whitelist else []
+    bl = [s.lower() for s in split_cfg.station_blacklist] if split_cfg.station_blacklist else []
+    if wl:   # 有白名单 -> 只允许白名单
+        return sta in wl
+    # 无白名单 -> 不在黑名单即可
+    return sta not in bl
 
-def collect_files(root: Path) -> Dict[str, List[Path]]:
+def _is_test_file(p: Path, split_cfg) -> bool:
     """
-    遍历 root，按 DOY 分组文件列表：
-      return {"train": [...], "test": [...]}
+    判定文件是否属于测试集：
+      1) always_test_stations 中的测站 -> 所有 DOY 都进测试
+      2) test_doys 中的 DOY -> 所有测站该 DOY 都进测试
     """
+    m = FNAME_DOY_RE.match(p.name)
+    if not m:
+        return False
+    doy = m.group(1)
+    sta = _station_from_fname(p)
+    ats = set(s.lower() for s in getattr(split_cfg, "always_test_stations", []))
+    if sta in ats:
+        return True
+    if doy in set(split_cfg.test_doys):
+        return True
+    return False
+
+def collect_files(root: Path, split_cfg) -> Dict[str, List[Path]]:
     train_files, test_files = [], []
+    root = Path(root)
     for p in root.rglob("*.csv"):
-        m = FNAME_DOY_RE.match(p.name)
-        if not m:
+        sta = _station_from_fname(p)
+        if not _allowed_station(sta, split_cfg):
             continue
-        doy = m.group(1)
-        if doy == DOY_TEST:
+        if _is_test_file(p, split_cfg):
             test_files.append(p)
-        elif doy in DOY_TRAIN_RANGE:
-            train_files.append(p)
-        # 其他 DOY（如果有）忽略
+        else:
+            # 若显式提供 train_doys，则仅收这些 DOY；否则“非 test 都进 train”
+            if split_cfg.train_doys:
+                m = FNAME_DOY_RE.match(p.name)
+                if not m:
+                    continue
+                doy = m.group(1)
+                if doy in set(split_cfg.train_doys):
+                    train_files.append(p)
+            else:
+                train_files.append(p)
     return {"train": sorted(train_files), "test": sorted(test_files)}
 
-
-def load_and_convert_file(csv_path: Path, window_size: int) -> List[Dict]:
+def load_and_convert_file(csv_path: Path, window_size: int, allow_constellations: List[str]) -> List[Dict]:
     """
-    读取单个CSV并转为样本列表。
-    仅处理 GPS(Gxx) / BDS(Cxx)，其他星座文件直接返回空。
+    读取单个CSV并转为样本列表；仅处理 GPS(G*) / BDS(C*)
     """
-    # 从文件名或内容判断卫星
-    # 文件名形如 abpo_G01_2024153.csv
-    # 也可从列 'satellite' 读取
     try:
         df = pd.read_csv(
             csv_path,
@@ -167,17 +162,17 @@ def load_and_convert_file(csv_path: Path, window_size: int) -> List[Dict]:
         print(f"[WARN] 读取失败，跳过: {csv_path} ({e})")
         return []
 
-    # 只保留 GPS/BDS
-    # 若整文件的 satellite 都一致可用列首字符判断；如混合则按行判断（理论上你的数据不会混）
+    # 如果缺少 station 列，用文件名前缀填充
+    if "station" not in df.columns:
+        df["station"] = _station_from_fname(csv_path)
+
+    # 只保留允许的星座
     if "satellite" not in df.columns:
         return []
-
-    # 过滤允许的星座
-    df = df[df["satellite"].astype(str).str[0].isin(ALLOW_CONSTELLATIONS)]
+    df = df[df["satellite"].astype(str).str[0].str.upper().isin([s.upper() for s in allow_constellations])]
     if df.empty:
         return []
 
-    # 按时间排序，构造时序
     df = df.sort_values("time_utc").reset_index(drop=True)
 
     samples: List[Dict] = []
@@ -186,20 +181,15 @@ def load_and_convert_file(csv_path: Path, window_size: int) -> List[Dict]:
         sample = row_to_sample(row, history, window_size)
         samples.append(sample)
         history.append(sample)
-        # 限制历史长度（与生成器类似，这里保留最近100个即可，足够窗口使用）
+        # 限制历史长度（足够窗口使用）
         if len(history) > 100:
             history = history[-100:]
 
     return samples
 
-
 def random_split(data: List[Dict], val_ratio: float, seed: int = 42):
-    """
-    从 data 随机划出 val_ratio 的验证集
-    """
     if val_ratio <= 0 or len(data) == 0:
         return data, []
-
     rng = np.random.RandomState(seed)
     idx = np.arange(len(data))
     rng.shuffle(idx)
@@ -210,54 +200,124 @@ def random_split(data: List[Dict], val_ratio: float, seed: int = 42):
     val_part = [data[i] for i in idx[:val_size]]
     return train_part, val_part
 
-
 def save_pickle(obj, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        pickle.dump(obj, f)
+    with open(path, "wb") as fp:
+        pickle.dump(obj, fp)  # 可选：protocol=pickle.HIGHEST_PROTOCOL
     print(f"[OK] Saved: {path}")
 
+def _extract_doy(path: Path) -> str:
+    m = FNAME_DOY_RE.match(path.name)
+    return m.group(1) if m else ""
+
+def _maybe_override_from_ini(cfg: Config, ini_path: Path) -> Config:
+    """
+    可选：使用 config.ini 覆盖 config.py 的默认值
+    """
+    if not ini_path.exists():
+        return cfg
+    parser = configparser.ConfigParser()
+    parser.read(ini_path, encoding="utf-8")
+
+    # [data]
+    if parser.has_section("data"):
+        if parser.has_option("data", "raw_root"):
+            cfg.data.raw_root = parser.get("data", "raw_root")
+        if parser.has_option("data", "processed_data_dir"):
+            cfg.data.processed_data_dir = parser.get("data", "processed_data_dir")
+        if parser.has_option("data", "window_size"):
+            cfg.data.window_size = parser.getint("data", "window_size")
+        if parser.has_option("data", "allow_constellations"):
+            v = parser.get("data", "allow_constellations")
+            cfg.data.allow_constellations = [s.strip() for s in v.split(",") if s.strip()]
+
+    # [split]
+    if parser.has_section("split"):
+        if parser.has_option("split", "always_test_stations"):
+            v = parser.get("split", "always_test_stations")
+            cfg.split.always_test_stations = [s.strip().lower() for s in v.split(",") if s.strip()]
+        if parser.has_option("split", "test_doys"):
+            v = parser.get("split", "test_doys")
+            cfg.split.test_doys = [s.strip() for s in v.split(",") if s.strip()]
+        if parser.has_option("split", "station_whitelist"):
+            v = parser.get("split", "station_whitelist")
+            cfg.split.station_whitelist = [s.strip().lower() for s in v.split(",") if s.strip()]
+        if parser.has_option("split", "station_blacklist"):
+            v = parser.get("split", "station_blacklist")
+            cfg.split.station_blacklist = [s.strip().lower() for s in v.split(",") if s.strip()]
+        if parser.has_option("split", "train_doys"):
+            v = parser.get("split", "train_doys")
+            cfg.split.train_doys = [s.strip() for s in v.split(",") if s.strip()]
+        if parser.has_option("split", "val_split_ratio"):
+            cfg.split.val_split_ratio = parser.getfloat("split", "val_split_ratio")
+
+    # [training]
+    if parser.has_section("training"):
+        if parser.has_option("training", "seed"):
+            cfg.training.seed = parser.getint("training", "seed")
+
+    return cfg
 
 def main():
-    config = Config()
+    # 1) 载入默认配置
+    config: Config = default_config
 
-    # 读取窗口大小；若未设置则给一个合理默认
-    window_size = getattr(getattr(config, "data", object()), "window_size", 16)
+    # 2) 若同目录存在 config.ini，则覆盖（可选）
+    ini_path = Path(__file__).with_name("config.ini")
+    config = _maybe_override_from_ini(config, ini_path)
+
+    window_size = config.data.window_size
+    out_dir = Path(config.data.processed_data_dir)
+    raw_root = Path(config.data.raw_root)
+    allow_const = config.data.allow_constellations
+    val_ratio = config.split.val_split_ratio
+    seed = config.training.seed
+
     print(f"[Info] window_size = {window_size}")
+    print(f"[Info] raw_root    = {raw_root}")
+    print(f"[Info] output dir  = {out_dir}")
+    print(f"[Info] allow const = {allow_const}")
+    print(f"[Info] always test stations = {config.split.always_test_stations}")
+    print(f"[Info] test DOYs   = {config.split.test_doys}")
+    if config.split.station_whitelist:
+        print(f"[Info] stations whitelist = {config.split.station_whitelist}")
+    if config.split.station_blacklist:
+        print(f"[Info] stations blacklist = {config.split.station_blacklist}")
+    if config.split.train_doys:
+        print(f"[Info] train DOYs (explicit) = {config.split.train_doys}")
+    print(f"[Info] val split ratio = {val_ratio} (seed={seed})")
 
-    # 输出目录优先取 Config.data.processed_data_dir，否则用默认
-    out_dir = getattr(getattr(config, "data", object()), "processed_data_dir", None)
-    out_dir = Path(out_dir) if out_dir else DEFAULT_OUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[Info] output dir = {out_dir}")
 
-    # 收集文件
-    groups = collect_files(RAW_ROOT)
+    # 3) 收集文件（按配置切分 train/test）
+    groups = collect_files(raw_root, config.split)
     train_files = groups["train"]
     test_files = groups["test"]
     print(f"[Info] train files: {len(train_files)}, test files: {len(test_files)}")
 
-    # 转换训练集文件
+    # 4) 转换训练集
     train_all: List[Dict] = []
     print("[Step] Converting TRAIN files...")
     for p in tqdm(train_files, desc="TRAIN"):
-        train_all.extend(load_and_convert_file(p, window_size))
+        train_all.extend(load_and_convert_file(p, window_size, allow_const))
 
-    # 从训练集随机抽取验证集
-    train_final, val_final = random_split(train_all, VAL_SPLIT_RATIO,
-                                          seed=getattr(getattr(config, "training", object()), "seed", 42))
+    # 5) 训练 -> 训练/验证
+    train_final, val_final = random_split(train_all, val_ratio, seed=seed)
     print(f"[Info] train samples: {len(train_final)}, val samples: {len(val_final)}")
 
-    # 转换测试集文件
+    # 6) 转换测试集
     test_final: List[Dict] = []
     print("[Step] Converting TEST files...")
     for p in tqdm(test_files, desc="TEST"):
-        test_final.extend(load_and_convert_file(p, window_size))
+        test_final.extend(load_and_convert_file(p, window_size, allow_const))
     print(f"[Info] test samples: {len(test_final)}")
 
-    # 统计
+    # 7) 统计信息
     def label_ratio(ds):
         return (sum(int(d.get("label", 0)) for d in ds) / len(ds)) if ds else 0.0
+
+    train_doys = sorted({_extract_doy(p) for p in train_files})
+    test_doys  = sorted({_extract_doy(p) for p in test_files})
 
     stats = {
         "total_samples": len(train_final) + len(val_final) + len(test_final),
@@ -267,14 +327,14 @@ def main():
         "train_flex_power_ratio": label_ratio(train_final),
         "val_flex_power_ratio": label_ratio(val_final),
         "test_flex_power_ratio": label_ratio(test_final),
-        "source_root": str(RAW_ROOT),
-        "allow_constellations": ALLOW_CONSTELLATIONS,
+        "source_root": str(raw_root),
+        "allow_constellations": allow_const,
         "window_size": window_size,
-        "train_days": sorted(list(DOY_TRAIN_RANGE)),
-        "test_day": DOY_TEST,
+        "train_doys": train_doys,
+        "test_doys": test_doys,
     }
 
-    # 保存
+    # 8) 保存
     save_pickle(train_final, out_dir / "train.pkl")
     save_pickle(val_final, out_dir / "val.pkl")
     save_pickle(test_final, out_dir / "test.pkl")
@@ -282,7 +342,6 @@ def main():
 
     print("\n[Done] Dataset conversion completed.")
     print(f"Output dir: {out_dir}")
-
 
 if __name__ == "__main__":
     main()

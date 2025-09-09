@@ -93,7 +93,7 @@ class FlexPowerDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.data[idx]
 
-        # 标准化载噪比数据
+        # 标准化载噪比
         s2w_current = (sample['s2w_current'] - self.s2w_mean) / self.s2w_std
         s1c_current = (sample['s1c_current'] - self.s1c_mean) / self.s1c_std
         diff_current = (sample['diff_current'] - self.diff_mean) / self.diff_std
@@ -102,9 +102,25 @@ class FlexPowerDataset(Dataset):
         s1c_sequence = (sample['s1c_sequence'] - self.s1c_mean) / self.s1c_std
         diff_sequence = (sample['diff_sequence'] - self.diff_mean) / self.diff_std
 
-        # 标准化位置数据（简单的归一化）
+        # 位置归一化
         station_pos = sample['station_position'] / 1e7
         satellite_pos = sample['satellite_position'] / 1e7
+
+        # ===== 新增：角度特征（用于训练）=====
+        # 缺失时返回 nan，最后统一替换为 0
+        elev_deg = float(sample.get('elevation', np.nan))
+        azim_deg = float(sample.get('azimuth', np.nan))
+
+        # 角度预处理（裁剪/取模）
+        elev_rad = np.deg2rad(np.clip(elev_deg, 0.0, 90.0))
+        azim_rad = np.deg2rad(np.mod(azim_deg, 360.0))
+
+        # sin/cos 编码（缺失用 0）
+        angle_feats = np.array([
+            np.sin(elev_rad), np.cos(elev_rad),
+            np.sin(azim_rad), np.cos(azim_rad)
+        ], dtype=np.float32)
+        angle_feats = np.nan_to_num(angle_feats, nan=0.0)
 
         return {
             's2w_current': torch.tensor(s2w_current, dtype=torch.float32),
@@ -117,7 +133,8 @@ class FlexPowerDataset(Dataset):
             'satellite_position': torch.tensor(satellite_pos, dtype=torch.float32),
             'local_time': torch.tensor(sample['local_time'], dtype=torch.float32),
             'satellite_id': torch.tensor(sample['satellite_id'], dtype=torch.long),
-            'label': torch.tensor(sample['label'], dtype=torch.long)
+            'angle_features': torch.tensor(angle_feats, dtype=torch.float32),  # <— 新增：4 维角度向量
+            'label': torch.tensor(sample['label'], dtype=torch.long),
         }
 
 class Trainer:
