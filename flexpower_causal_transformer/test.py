@@ -268,26 +268,41 @@ class Tester:
 		plt.close()
 
 	def plot_roc_curve(self, save_path: str = None):
-		"""绘制ROC曲线"""
-		fpr, tpr, thresholds = roc_curve(
-			self.results['labels'],
-			self.results['probabilities'][:, 1]
-		)
-		roc_auc = roc_auc_score(
-			self.results['labels'],
-			self.results['probabilities'][:, 1]
-		)
+		"""绘制ROC曲线（在 y_true 含两类时才绘制）"""
+		y_true = self.results['labels']
+		y_prob = self.results['probabilities'][:, 1] if self.results['probabilities'] is not None else None
+
+		# 防守：需要两类 & 概率可用
+		import numpy as np
+		uniq = np.unique(y_true)
+		if y_prob is None or len(uniq) < 2:
+			logger.warning("Skip ROC: y_true does not contain both classes or probabilities missing.")
+			if save_path:
+				# 生成一个占位说明图，避免下游流程断
+				import matplotlib.pyplot as plt
+				plt.figure(figsize=(8, 4))
+				plt.text(0.5, 0.5, "ROC not defined:\nOnly one class present in y_true.",
+						 ha='center', va='center')
+				plt.axis('off')
+				plt.savefig(save_path, dpi=200, bbox_inches='tight')
+				plt.close()
+				logger.info(f"Placeholder ROC note saved to {save_path}")
+			return
+
+		from sklearn.metrics import roc_curve, roc_auc_score
+		from matplotlib import pyplot as plt
+		fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+		roc_auc = roc_auc_score(y_true, y_prob)
 
 		plt.figure(figsize=(8, 6))
-		plt.plot(fpr, tpr, color='darkorange', lw=2,
-				 label=f'ROC curve (AUC = {roc_auc:.2f})')
-		plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-		plt.xlim([0.0, 1.0])
+		plt.plot(fpr, tpr, lw=2, label=f'ROC (AUC = {roc_auc:.2f})')
+		plt.plot([0, 1], [0, 1], lw=2, linestyle='--')
+		plt.xlim([0.0, 1.0]);
 		plt.ylim([0.0, 1.05])
-		plt.xlabel('False Positive Rate')
+		plt.xlabel('False Positive Rate');
 		plt.ylabel('True Positive Rate')
 		plt.title('Receiver Operating Characteristic (ROC) Curve')
-		plt.legend(loc="lower right")
+		plt.legend(loc="lower right");
 		plt.grid(True, alpha=0.3)
 
 		if save_path:
@@ -295,7 +310,6 @@ class Tester:
 			logger.info(f"ROC curve saved to {save_path}")
 		else:
 			plt.show()
-
 		plt.close()
 
 	def analyze_errors(self, num_examples: int = 10):
@@ -339,6 +353,12 @@ class Tester:
 			logger.info(f"  Diff CNR: {sample['diff_current']:.2f}")
 			if sample['elevation'] is not None:
 				logger.info(f"  Elevation: {sample['elevation']:.1f}°")
+
+	def _fmt4(self, x):
+		import numpy as np
+		if x is None or (isinstance(x, float) and not np.isfinite(x)):
+			return "N/A"
+		return f"{x:.4f}"
 
 	def save_results(self, output_dir: str):
 		"""保存测试结果（含逐卫星 + 总体指标、可视化图表、报告、MATLAB兼容数据）"""
@@ -448,11 +468,11 @@ class Tester:
 			f.write("-" * 60 + "\n")
 			f.write("PERFORMANCE METRICS\n")
 			f.write("-" * 60 + "\n")
-			f.write(f"Accuracy:  {metrics['accuracy']:.4f}\n")
-			f.write(f"Precision: {metrics['precision']:.4f}\n")
-			f.write(f"Recall:    {metrics['recall']:.4f}\n")
-			f.write(f"F1 Score:  {metrics['f1']:.4f}\n")
-			f.write(f"ROC AUC:   {metrics['roc_auc']:.4f}\n\n")
+			f.write(f"Accuracy:  {self._fmt4(metrics['accuracy'])}\n")
+			f.write(f"Precision: {self._fmt4(metrics.get('precision'))}\n")
+			f.write(f"Recall:    {self._fmt4(metrics.get('recall'))}\n")
+			f.write(f"F1 Score:  {self._fmt4(metrics.get('f1'))}\n")
+			f.write(f"ROC AUC:   {self._fmt4(metrics.get('roc_auc'))}\n\n")
 
 			f.write("-" * 60 + "\n")
 			f.write("CONFUSION MATRIX\n")
@@ -469,9 +489,9 @@ class Tester:
 			for class_name, class_metrics in metrics['classification_report'].items():
 				if class_name in ['No Flex Power', 'Flex Power']:
 					f.write(f"\n{class_name}:\n")
-					f.write(f"  Precision: {class_metrics['precision']:.4f}\n")
-					f.write(f"  Recall:    {class_metrics['recall']:.4f}\n")
-					f.write(f"  F1-Score:  {class_metrics['f1-score']:.4f}\n")
+					f.write(f"  Precision: {self._fmt4(class_metrics.get('precision'))}\n")
+					f.write(f"  Recall:    {self._fmt4(class_metrics.get('recall'))}\n")
+					f.write(f"  F1-Score:  {self._fmt4(class_metrics.get('f1-score'))}\n")
 					f.write(f"  Support:   {class_metrics['support']}\n")
 
 			f.write("\n" + "=" * 60 + "\n")

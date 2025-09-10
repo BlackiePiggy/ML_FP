@@ -122,6 +122,17 @@ def _is_test_file(p: Path, split_cfg) -> bool:
 def collect_files(root: Path, split_cfg) -> Dict[str, List[Path]]:
     train_files, test_files = [], []
     root = Path(root)
+
+    # 如果开启了“全部进测试集”开关
+    if getattr(split_cfg, "all_to_test", False):
+        for p in root.rglob("*.csv"):
+            sta = _station_from_fname(p)
+            if not _allowed_station(sta, split_cfg):
+                continue
+            test_files.append(p)
+        return {"train": [], "test": sorted(test_files)}
+
+    # 正常逻辑（未开启时）
     for p in root.rglob("*.csv"):
         sta = _station_from_fname(p)
         if not _allowed_station(sta, split_cfg):
@@ -129,7 +140,6 @@ def collect_files(root: Path, split_cfg) -> Dict[str, List[Path]]:
         if _is_test_file(p, split_cfg):
             test_files.append(p)
         else:
-            # 若显式提供 train_doys，则仅收这些 DOY；否则“非 test 都进 train”
             if split_cfg.train_doys:
                 m = FNAME_DOY_RE.match(p.name)
                 if not m:
@@ -140,6 +150,7 @@ def collect_files(root: Path, split_cfg) -> Dict[str, List[Path]]:
             else:
                 train_files.append(p)
     return {"train": sorted(train_files), "test": sorted(test_files)}
+
 
 def load_and_convert_file(csv_path: Path, window_size: int, allow_constellations: List[str]) -> List[Dict]:
     """
@@ -250,6 +261,12 @@ def _maybe_override_from_ini(cfg: Config, ini_path: Path) -> Config:
             cfg.split.train_doys = [s.strip() for s in v.split(",") if s.strip()]
         if parser.has_option("split", "val_split_ratio"):
             cfg.split.val_split_ratio = parser.getfloat("split", "val_split_ratio")
+            # 先给个默认值（如果 Config 里原本没有这个字段也没关系）
+            if not hasattr(cfg.split, "all_to_test"):
+                setattr(cfg.split, "all_to_test", False)
+
+            if parser.has_option("split", "all_to_test"):
+                cfg.split.all_to_test = parser.getboolean("split", "all_to_test")
 
     # [training]
     if parser.has_section("training"):
@@ -286,6 +303,7 @@ def main():
     if config.split.train_doys:
         print(f"[Info] train DOYs (explicit) = {config.split.train_doys}")
     print(f"[Info] val split ratio = {val_ratio} (seed={seed})")
+    print(f"[Info] all_to_test = {getattr(config.split, 'all_to_test', False)}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
 

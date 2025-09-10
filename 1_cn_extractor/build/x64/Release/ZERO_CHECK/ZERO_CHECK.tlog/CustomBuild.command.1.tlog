@@ -1,0 +1,10 @@
+^E:\PROJECTS\ML_FP\1_CN_EXTRACTOR\BUILD\CMAKEFILES\5E32DAD412443853405BA65A0448A54A\GENERATE.STAMP.RULE
+setlocal
+D:\softwares\cmake\bin\cmake.exe -SE:/projects/ML_FP/1_cn_extractor -BE:/projects/ML_FP/1_cn_extractor/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file E:/projects/ML_FP/1_cn_extractor/build/rinex_snr_extractor.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
