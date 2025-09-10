@@ -42,13 +42,24 @@ class FlexPowerDataset(Dataset):
         self.config = config
         self.is_training = is_training
 
-        # 加载数据
+        # 加载数据（可能是分组，也可能是扁平）
         with open(data_path, 'rb') as f:
-            self.data = pickle.load(f)
+            loaded = pickle.load(f)
 
-        logger.info(f"Loaded {len(self.data)} samples from {data_path}")
+        if isinstance(loaded, list) and len(loaded) > 0 and isinstance(loaded[0], dict) and 'samples' in loaded[0]:
+            # 分组格式：展开
+            grouped = loaded
+            self.group_count = len(grouped)
+            self.data = self._flatten_grouped(grouped)
+            logger.info(
+                f"Loaded GROUPED dataset: groups={self.group_count}, flattened samples={len(self.data)} from {data_path}")
+        else:
+            # 仍支持旧的扁平格式
+            self.group_count = 0
+            self.data = loaded if isinstance(loaded, list) else []
+            logger.info(f"Loaded FLAT dataset: samples={len(self.data)} from {data_path}")
 
-        # 计算标准化参数（仅在训练集上计算）
+        # 仅在训练集上计算标准化
         if is_training:
             self._compute_normalization_params()
 
@@ -86,6 +97,41 @@ class FlexPowerDataset(Dataset):
         self.s1c_std = params['s1c_std']
         self.diff_mean = params['diff_mean']
         self.diff_std = params['diff_std']
+
+    def _flatten_grouped(self, grouped):
+        """把分组结构 [{'station':..., 'satellite':..., 'date':..., 'samples':[...]}] 攤平成样本 list"""
+        flat = []
+        for g in grouped:
+            samples = g.get('samples', [])
+            # 兜底：把 station/satellite/date 写回每个 sample（若 sample 已有 station_name/timestamp 等就不覆盖）
+            for s in samples:
+                if 'station_name' not in s and 'station' in g:
+                    s['station_name'] = g['station']
+                if 'satellite_prn' not in s and 'satellite' in g:
+                    s['satellite_prn'] = g['satellite']
+                if 'timestamp' not in s and 'date' in g and 'local_time' in s and len(s['local_time']) >= 6:
+                    # 如果只有 date + local_time，则拼回 datetime（可选）
+                    from datetime import datetime
+                    ymd = g['date']
+                    try:
+                        if ymd.isdigit() and len(ymd) == 7:
+                            # 形如 YYYYDDD（DOY）
+                            import datetime as _dt
+                            year = int(ymd[:4]);
+                            doy = int(ymd[4:])
+                            dt = _dt.datetime(year, 1, 1) + _dt.timedelta(days=doy - 1,
+                                                                          hours=int(s['local_time'][3]),
+                                                                          minutes=int(s['local_time'][4]),
+                                                                          seconds=int(s['local_time'][5]))
+                        else:
+                            year, month, day = map(int, ymd.split('-'))
+                            dt = datetime(year, month, day, int(s['local_time'][3]), int(s['local_time'][4]),
+                                          int(s['local_time'][5]))
+                        s['timestamp'] = dt
+                    except Exception:
+                        pass
+                flat.append(s)
+        return flat
 
     def __len__(self):
         return len(self.data)

@@ -7,28 +7,36 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 
+from dataclasses import dataclass, field
+from pathlib import Path
+
 @dataclass
 class DataConfig:
-    """数据相关配置"""
-    # 数据路径
-    data_root: str = "./data"
-    raw_data_dir: str = field(default_factory=lambda: os.path.join("../data/2", "raw"))
-    processed_data_dir: str = field(default_factory=lambda: os.path.join("../data/2", "4_raw_dataset"))
-    train_data_path: str = field(default_factory=lambda: os.path.join("../data/2", "4_raw_dataset", "train.pkl"))
-    val_data_path: str = field(default_factory=lambda: os.path.join("../data/2", "4_raw_dataset", "val.pkl"))
-    test_data_path: str = field(default_factory=lambda: os.path.join("../data/2", "4_raw_dataset", "test.pkl"))
+    # 抽取出来的根目录（可改成绝对路径 or 通过环境变量覆盖）
+    data_root: Path = Path("../data/2")
+
+    # 其它字段由 data_root 推导，初始化后再赋值
+    processed_data_dir: Path = field(init=False)
+    train_data_path: Path = field(init=False)
+    val_data_path: Path = field(init=False)
+    test_data_path: Path = field(init=False)
 
     # 数据参数
-    window_size: int = 5  # 前序窗口大小
-    satellite_num: int = 32  # GPS卫星数量 (G01-G32)
+    window_size: int = 5
+    satellite_num: int = 32
 
     # 数据分割比例
     train_ratio: float = 0.7
     val_ratio: float = 0.15
     test_ratio: float = 0.15
 
-    # 采样参数
-    sampling_rate: int = 30  # 采样间隔（秒）
+    sampling_rate: int = 30
+
+    def __post_init__(self):
+        self.processed_data_dir = self.data_root / "4_raw_dataset"
+        self.train_data_path   = self.processed_data_dir / "train.pkl"
+        self.val_data_path     = self.processed_data_dir / "val.pkl"
+        self.test_data_path    = self.processed_data_dir / "test.pkl"
 
 @dataclass
 class ModelConfig:
@@ -209,8 +217,6 @@ if __name__ == "__main__":
     config = Config()
 
     # 创建必要的目录
-    os.makedirs(config.data.data_root, exist_ok=True)
-    os.makedirs(config.data.raw_data_dir, exist_ok=True)
     os.makedirs(config.data.processed_data_dir, exist_ok=True)
     os.makedirs(config.training.checkpoint_dir, exist_ok=True)
     os.makedirs(config.training.log_dir, exist_ok=True)

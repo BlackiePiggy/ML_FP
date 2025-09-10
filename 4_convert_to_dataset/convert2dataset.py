@@ -19,6 +19,8 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import configparser
+from collections import defaultdict
+
 
 from config import default_config, Config  # 改造后的 config.py
 
@@ -275,6 +277,31 @@ def _maybe_override_from_ini(cfg: Config, ini_path: Path) -> Config:
 
     return cfg
 
+def _group_key(sample):
+    """(station, satellite, day) 作为分组键；day 默认用 YYYY-MM-DD"""
+    station = str(sample["station_name"]).lower()
+    sat = str(sample["satellite_prn"])
+    day = sample["timestamp"].date().isoformat()  # 若想按 DOY 分组，改成下面注释：
+    # day = f"{sample['timestamp'].year}{sample['timestamp'].timetuple().tm_yday:03d}"
+    return (station, sat, day)
+
+def group_by_station_sat_day(samples):
+    """将扁平样本列表分成 [{station, satellite, date, samples:[...]}, ...]"""
+    buckets = defaultdict(list)
+    for s in samples:
+        buckets[_group_key(s)].append(s)
+    grouped = []
+    for (sta, sat, day), lst in buckets.items():
+        lst_sorted = sorted(lst, key=lambda x: x["timestamp"])
+        grouped.append({
+            "station": sta,
+            "satellite": sat,
+            "date": day,
+            "samples": lst_sorted,
+        })
+    grouped.sort(key=lambda g: (g["station"], g["satellite"], g["date"]))
+    return grouped
+
 def main():
     # 1) 载入默认配置
     config: Config = default_config
@@ -352,11 +379,34 @@ def main():
         "test_doys": test_doys,
     }
 
-    # 8) 保存
-    save_pickle(train_final, out_dir / "train.pkl")
-    save_pickle(val_final, out_dir / "val.pkl")
-    save_pickle(test_final, out_dir / "test.pkl")
+    # 8) 分组并保存（覆盖 train/val/test 为“分组版”）
+    train_grouped = group_by_station_sat_day(train_final)
+    val_grouped = group_by_station_sat_day(val_final)
+    test_grouped = group_by_station_sat_day(test_final)
+
+    # 统计也顺带给出组数，便于 sanity check
+    stats = {
+        "total_groups": len(train_grouped) + len(val_grouped) + len(test_grouped),
+        "train_groups": len(train_grouped),
+        "val_groups": len(val_grouped),
+        "test_groups": len(test_grouped),
+        "total_samples": len(train_final) + len(val_final) + len(test_final),
+        "train_samples": len(train_final),
+        "val_samples": len(val_final),
+        "test_samples": len(test_final),
+        "source_root": str(raw_root),
+        "allow_constellations": allow_const,
+        "window_size": window_size,
+        "train_doys": train_doys,
+        "test_doys": test_doys,
+    }
+
+    save_pickle(train_grouped, out_dir / "train.pkl")
+    save_pickle(val_grouped, out_dir / "val.pkl")
+    save_pickle(test_grouped, out_dir / "test.pkl")
     save_pickle(stats, out_dir / "dataset_stats.pkl")
+
+    print(f"[Info] grouped: train={len(train_grouped)}, val={len(val_grouped)}, test={len(test_grouped)}")
 
     print("\n[Done] Dataset conversion completed.")
     print(f"Output dir: {out_dir}")
